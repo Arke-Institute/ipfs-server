@@ -38,3 +38,7 @@ docker-volumes/
 # Temporary files
 tmp/
 temp/
+
+# DR artifacts (generated locally, not checked in)
+snapshots/
+backups/
