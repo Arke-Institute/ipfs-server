@@ -96,7 +96,7 @@ curl -X POST http://localhost:5001/api/v0/repo/stat | jq '{RepoSize, NumObjects,
 
 ## Phase 2: Build Snapshot & Export CAR
 
-**Goal**: Create backup artifacts.
+**Goal**: Create backup artifacts with chain head preservation.
 
 ### Step 2.1: Build Snapshot
 
@@ -107,14 +107,15 @@ curl -X POST http://localhost:5001/api/v0/repo/stat | jq '{RepoSize, NumObjects,
 **Expected Output**:
 ```
 [INFO] Building snapshot index...
-[SUCCESS] Found 1 .tip files
+[SUCCESS] Found 3 .tip files
+[INFO] Walking chain from head...
 ...
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Snapshot Build Complete
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CID:      baguqeeraz...
-Sequence: 1
-Entities: 1
+Sequence: 2
+Entities: 3
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
@@ -134,6 +135,16 @@ curl -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq .
 echo "$SNAP_CID" | grep -q '^baguqee' && echo "✓ dag-json format" || echo "✗ Wrong format!"
 ```
 
+**⚠️ CRITICAL: Verify chain_cid is IPLD link format**:
+```bash
+# Fetch a snapshot chunk and verify chain_cid format
+CHUNK_CID=$(curl -s -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq -r '.entries_head["/"]')
+curl -X POST "http://localhost:5001/api/v0/dag/get?arg=$CHUNK_CID" | jq '.entries[0].chain_cid'
+
+# Expected: {"/": "baguqee..."}  ✓ CORRECT
+# NOT:      "baguqee..."          ✗ WRONG - chain entries won't be in CAR!
+```
+
 ### Step 2.2: Export CAR
 
 ```bash
@@ -143,25 +154,35 @@ echo "$SNAP_CID" | grep -q '^baguqee' && echo "✓ dag-json format" || echo "✗
 **Expected Output**:
 ```
 [INFO] Exporting snapshot to CAR...
+[INFO] Running: ipfs dag export baguqee... (with 60s timeout)
 ...
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CAR Export Complete
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-File:      arke-1-20251010-023429.car
-Size:      0.42 MB
-Location:  ./backups/arke-1-20251010-023429.car
+File:      arke-2-20251012-030530.car
+Size:      1.8 KB
+Location:  ./backups/arke-2-20251012-030530.car
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-Note: CAR size will be much larger than snapshot (includes all blocks in graph)
+**Note on timing**:
+- Small archives (< 10 entities) export in < 5 seconds
+- The script uses 60s timeout as `ipfs dag export` may not exit cleanly
+- File validation happens after timeout, checking size and existence
 
 **Record**:
 - CAR filename: ____________
-- CAR size: ____________ MB
+- CAR size: ____________ KB or MB
 
-**Verify CAR file exists**:
+**Verify CAR file exists and has content**:
 ```bash
 ls -lh backups/*.car
+# Should see non-zero file size
+
+# Verify CAR contains chain entry blocks (critical!)
+CAR_FILE=$(ls -t backups/*.car | head -1)
+echo "Verifying chain entries are in CAR..."
+# This will be validated in Phase 5 when we test /entities endpoint
 ```
 
 ---
@@ -285,7 +306,66 @@ System restored from CAR file! Ready to serve requests.
 
 ## Phase 5: Verification
 
-**Goal**: Prove restored system matches original.
+**Goal**: Prove restored system matches original AND chain head is preserved.
+
+### Step 5.0: ⚠️ CRITICAL - Verify /entities Endpoint Works
+
+**This validates that chain entries were included in CAR!**
+
+```bash
+# Test the /entities API endpoint
+curl -s 'http://localhost:3000/entities?limit=10' | jq .
+```
+
+**Expected Output**:
+```json
+{
+  "items": [
+    {
+      "pi": "ENTITY_3",
+      "ver": 1,
+      "tip": "bafyrei...",
+      "ts": "2025-10-12T03:05:17.899637Z"
+    },
+    {
+      "pi": "ENTITY_2",
+      "ver": 1,
+      "tip": "bafyreic...",
+      "ts": "2025-10-12T03:05:17.835055Z"
+    },
+    {
+      "pi": "ENTITY_1",
+      "ver": 1,
+      "tip": "bafyreid...",
+      "ts": "2025-10-12T03:05:17.769678Z"
+    }
+  ],
+  "total_count": 3,
+  "has_more": false,
+  "next_cursor": null
+}
+```
+
+**⚠️ CRITICAL CHECK**:
+- If endpoint returns `{"items": [], "total_count": 0}` → Chain entry blocks are MISSING!
+- This means `chain_cid` was stored as plain string, not IPLD link
+- See troubleshooting section in DISASTER_RECOVERY.md
+
+**Verify index pointer has recent_chain_head**:
+```bash
+curl -X POST http://localhost:5001/api/v0/files/read?arg=/arke/index-pointer | jq .
+
+# Should show:
+# {
+#   "recent_chain_head": {"/":" "baguqee..."},  ← NOT null!
+#   "latest_snapshot_cid": "baguqee...",
+#   ...
+# }
+```
+
+**Result**:
+- `/entities` returns all entities? ☐ Yes ☐ No
+- `recent_chain_head` is not null? ☐ Yes ☐ No
 
 ### Step 5.1: Count Entities
 
@@ -457,9 +537,12 @@ done
 | 1.2 | Record sample entity | ☐ Pass ☐ Fail |
 | 1.3 | Verify version history | ☐ Pass ☐ Fail |
 | 2.1 | Build snapshot | ☐ Pass ☐ Fail |
+| 2.1b | **Verify chain_cid IPLD format** | ☐ Pass ☐ Fail |
 | 2.2 | Export CAR | ☐ Pass ☐ Fail |
 | 3.2 | **Delete volumes (nuclear)** | ☐ Completed |
 | 4.1 | Restore from CAR | ☐ Pass ☐ Fail |
+| **5.0** | **⚠️ /entities endpoint works** | ☐ Pass ☐ Fail |
+| **5.0b** | **⚠️ recent_chain_head not null** | ☐ Pass ☐ Fail |
 | 5.1 | Entity count matches | ☐ Pass ☐ Fail |
 | 5.2 | Sample entity matches | ☐ Pass ☐ Fail |
 | 5.3 | Version history intact | ☐ Pass ☐ Fail |
@@ -471,11 +554,15 @@ done
 ### Success Criteria
 
 **DR test passes if**:
+- ✅ **All chain entries preserved** (validated by `/entities` endpoint working)
+- ✅ **`recent_chain_head` not null** in restored index pointer
 - ✅ All Phase 5 verifications match Phase 1
 - ✅ All `.tip` files restored correctly
 - ✅ All version histories intact
 - ✅ All components retrievable
 - ✅ New operations work (Phase 6)
+
+**⚠️ CRITICAL**: Steps 5.0 and 5.0b are non-negotiable. If these fail, the DR system is broken.
 
 **Overall Result**: ☐ PASS ☐ FAIL
 
@@ -510,6 +597,32 @@ curl -X POST http://localhost:5001/api/v0/files/ls?arg=/arke/index/01/K7
 
 ---
 
+### /entities Endpoint Returns Empty
+
+**Symptom**: Step 5.0 fails - `/entities` returns `{"items": [], "total_count": 0}`
+
+**Root Cause**: Chain entry blocks not included in CAR because `chain_cid` was plain string
+
+**Debug**:
+```bash
+# Check if chain head CID exists in IPFS
+curl -X POST http://localhost:5001/api/v0/files/read?arg=/arke/index-pointer | jq -r '.recent_chain_head["/"]'
+# Copy the CID and try to fetch it:
+curl -sf -X POST "http://localhost:5001/api/v0/dag/get?arg=<CHAIN_HEAD_CID>"
+# If this times out or errors → block is missing!
+```
+
+**Fix**:
+1. Check `build-snapshot.sh` around line 88
+2. Ensure it uses: `chain_cid: {"/": $chain_cid}` NOT `chain_cid: $chain_cid`
+3. Rebuild snapshot
+4. Re-export CAR
+5. Restore again
+
+**Prevention**: Always verify chain_cid format in Step 2.1b before export
+
+---
+
 ## Cleanup
 
 After successful test:
@@ -535,26 +648,44 @@ After successful test:
 ---
 
 **Test Completed By**: Claude Code
-**Date**: 2025-10-10
-**Duration**: 20 minutes
+**Date**: 2025-10-12
+**Duration**: 20 minutes (with clean environment setup)
 **Overall Result**: ✓ PASS
 
 ---
 
-**Actual Test Results**:
+**Actual Test Results** (2025-10-12):
 - Complete data destruction confirmed (all volumes deleted)
-- CAR import: 6 blocks (446KB)
+- Clean environment: 3 fresh test entities (ENTITY_1, ENTITY_2, ENTITY_3)
+- Snapshot build: v3 schema with linked list chunks
+- CAR export: 1.8 KB (6 blocks total)
+- CAR import: 6 blocks restored
 - MFS rebuild: automatic, no manual intervention
+- Index pointer: `recent_chain_head` preserved correctly
+- **Critical validation**: `/entities` endpoint working (returned all 3 entities)
 - Verification: All .tip files created correctly
-- Entity accessibility: Full end-to-end access confirmed (manifest, metadata, images)
+- Entity accessibility: Full end-to-end access confirmed
 - System fully operational after restore
 
 **Key Learnings**:
-1. dag-json codec is critical for IPLD link preservation
-2. Logging to stderr prevents stdout contamination in bash functions
-3. Array indexing more reliable than bash streaming for parsing
-4. MFS must be rebuilt from snapshot (not included in CAR)
-5. Single CAR file contains complete system state for full recovery
+1. **CRITICAL**: `chain_cid` MUST be stored as IPLD link `{"/": $cid}` NOT plain string
+   - Plain string format: CAR export doesn't follow link → chain entry blocks not included
+   - IPLD link format: CAR export follows link → chain entry blocks included
+   - Without chain entries, `/entities` endpoint returns empty after restore
+2. dag-json codec is critical for IPLD link preservation
+3. Timeout handling required for `ipfs dag export/import` (commands don't exit cleanly)
+4. File validation (existence + size) more reliable than command exit codes
+5. `.env` file inline comments break bash arithmetic parsing
+6. Logging to stderr prevents stdout contamination in bash functions
+7. MFS must be rebuilt from snapshot (not included in CAR)
+8. Index pointer must be recreated with `recent_chain_head` from last snapshot entry
+9. Single CAR file contains complete system state for full recovery
+
+**Critical Implementation Detail**:
+The `recent_chain_head` preservation was the primary goal of the 2025-10-12 test. Without it, the `/entities` endpoint (which walks the PI chain) would not function after disaster recovery. The fix required:
+- Adding `chain_cid` field to snapshot entries
+- Storing it as IPLD link format so CAR exporter includes the blocks
+- Extracting it during restore to populate index pointer
 
 ---
 

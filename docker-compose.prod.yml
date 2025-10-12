@@ -45,6 +45,14 @@ services:
       - "127.0.0.1:3000:3000"  # Localhost only
     environment:
       - IPFS_API_URL=http://ipfs:5001/api/v0
+      - REBUILD_THRESHOLD=10000    # Higher threshold for production
+      - AUTO_SNAPSHOT=true          # Enable automatic snapshot triggering
+      - KEEP_LAST=5                 # Keep last 5 snapshots pinned
+      - AUTO_CLEANUP=true           # Enable automatic pin cleanup
+    volumes:
+      - ./scripts:/app/scripts:ro   # Mount scripts for snapshot triggering
+      - ./snapshots:/app/snapshots  # Mount snapshots directory
+      - ./backups:/app/backups      # Mount backups directory
     depends_on:
       - ipfs
     restart: always

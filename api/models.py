@@ -1,14 +1,16 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional
 
 class IndexPointer(BaseModel):
+    model_config = ConfigDict(extra='allow')  # Allow extra fields from JSON
+
     schema: str = "arke/index-pointer@v1"
     latest_snapshot_cid: Optional[str] = None
     snapshot_seq: int = 0
     snapshot_count: int = 0
     snapshot_ts: Optional[str] = None
-    recent_chain_head: Optional[str] = None
-    recent_count: int = 0
+    recent_chain_head: Optional[str] = None  # Always points to the latest entity (never reset to null)
+    recent_count: int = 0  # Number of new entities since last snapshot
     total_count: int = 0
     last_updated: str
 
@@ -21,18 +23,19 @@ class ChainEntry(BaseModel):
     prev: Optional[dict] = None  # IPLD link or null
 
 class SnapshotChunk(BaseModel):
-    schema: str = "arke/snapshot-chunk@v1"
+    schema: str = "arke/snapshot-chunk@v2"
     chunk_index: int
     entries: list[dict]
+    prev: Optional[dict] = None  # IPLD link to previous chunk (linked list)
 
 class Snapshot(BaseModel):
-    schema: str = "arke/snapshot@v2"
+    schema: str = "arke/snapshot@v3"
     seq: int
     ts: str
-    prev_snapshot: Optional[dict] = None
+    prev_snapshot: Optional[dict] = None  # Link to previous snapshot
     total_count: int
     chunk_size: int
-    chunks: list[dict]  # List of IPLD links
+    entries_head: Optional[dict] = None  # IPLD link to head of chunk linked list
 
 class EntitiesResponse(BaseModel):
     items: list[dict]

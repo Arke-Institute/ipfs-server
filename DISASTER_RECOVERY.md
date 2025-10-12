@@ -62,44 +62,70 @@ The DR strategy is built around **snapshot-based CAR exports** that capture:
 
 ## Data Model
 
-### Snapshot Index (dag-json)
+### Snapshot Index (dag-json) - v3
+
+**Current Schema**: v3 uses linked list of chunks for scalability
 
 ```json
 {
-  "schema": "arke/snapshot-index@v1",
+  "schema": "arke/snapshot@v3",
   "seq": 42,
-  "ts": "2025-10-09T23:00:00Z",
-  "prev": { "/": "baguqee...SNAP41" },  // link to previous snapshot (optional)
+  "ts": "2025-10-12T03:05:24Z",
+  "prev_snapshot": { "/": "baguqee...SNAP41" },  // link to previous snapshot (optional)
+  "chunk_size": 10000,
+  "total_count": 3,
+  "entries_head": { "/": "baguqee...CHUNK_HEAD" }  // link to newest chunk
+}
+```
+
+**Snapshot Chunk** (linked list node):
+```json
+{
+  "schema": "arke/snapshot-chunk@v2",
+  "chunk_index": 0,
+  "prev": { "/": "baguqee...PREV_CHUNK" },  // link to older chunk (null for tail)
   "entries": [
     {
-      "pi": "01K75GZSKKSP2K6TP05JBFNV09",
+      "pi": "ENTITY_1",
       "ver": 2,
-      "tip": { "/": "baguqeerayq..." }
-    },
-    {
-      "pi": "01K75HQQXNTDG7BBP7PS9AWYAN",
-      "ver": 1,
-      "tip": { "/": "baguqeerayq..." }
+      "tip": { "/": "bafyrei..." },
+      "chain_cid": { "/": "baguqee..." },  // ⚠️ CRITICAL: Must be IPLD link!
+      "ts": "2025-10-12T03:05:17.769678Z"
     }
   ]
 }
 ```
 
 **Fields**:
-- `schema`: Always `"arke/snapshot-index@v1"`
+- `schema`: Always `"arke/snapshot@v3"` for snapshot root
 - `seq`: Monotonically increasing snapshot number (1, 2, 3, ...)
 - `ts`: ISO 8601 timestamp of snapshot creation
-- `prev`: IPLD link to previous snapshot (for chaining; null for first)
-- `entries`: Array of all entities with their current tip
+- `prev_snapshot`: IPLD link to previous snapshot (for chaining; null for first)
+- `chunk_size`: Maximum entries per chunk (default: 10000)
+- `total_count`: Total entities across all chunks
+- `entries_head`: IPLD link to most recent chunk (walk backwards via `prev`)
+- **`chain_cid`**: ⚠️ **CRITICAL** - Must be IPLD link format `{"/": "cid"}`, NOT plain string
 
 **Why dag-json and IPLD Links?**
 
 **Critical**: The snapshot MUST be stored as `dag-json` (not `dag-cbor`) to ensure IPLD links are properly preserved for CAR export.
 
 Using `{"/": "cid"}` format with dag-json ensures CAR exporters follow links and include:
-- All tip manifests
+- All tip manifests (via `tip` field)
 - All historical manifests (via `prev` links in manifests)
 - All components (metadata, files, images)
+- **All chain entries** (via `chain_cid` field) ⚠️ **CRITICAL FOR /entities ENDPOINT**
+
+**⚠️ IPLD Link Requirement**:
+```bash
+# WRONG - plain string (chain entries NOT included in CAR):
+"chain_cid": "baguqee..."
+
+# CORRECT - IPLD link (chain entries included in CAR):
+"chain_cid": {"/": "baguqee..."}
+```
+
+The CAR exporter ONLY follows IPLD links in `{"/": "cid"}` format. Plain string CIDs are stored but not followed, causing missing blocks after restore.
 
 **Important Implementation Detail**: Use the Kubo CLI (`ipfs dag put --store-codec=dag-json`) instead of the HTTP API, as the HTTP API's dag-cbor encoding doesn't preserve IPLD link semantics correctly.
 
@@ -109,7 +135,7 @@ Using `{"/": "cid"}` format with dag-json ensures CAR exporters follow links and
 
 ### 1. Build Snapshot (`scripts/build-snapshot.sh`)
 
-**Purpose**: Scan MFS, create snapshot index
+**Purpose**: Scan MFS and chain, create snapshot with preserved chain head
 
 **Usage**:
 ```bash
@@ -117,14 +143,19 @@ Using `{"/": "cid"}` format with dag-json ensures CAR exporters follow links and
 ```
 
 **What it does**:
-1. Recursively walks `/arke/index/` to find all `.tip` files
-2. Reads each tip to get manifest CID
-3. Fetches manifest to get version number
-4. Builds snapshot object with all entries
-5. Stores as dag-json using Kubo CLI (`ipfs dag put --store-codec=dag-json`)
-6. Saves metadata to `snapshots/latest.json`
+1. Reads current index pointer from `/arke/index-pointer`
+2. Walks the PI chain from `recent_chain_head` to collect all entities
+3. For each entity: reads `.tip` file, fetches manifest for version number
+4. **CRITICAL**: Stores `chain_cid` as IPLD link `{"/": $chain_cid}` (not plain string)
+5. Creates linked list of snapshot chunks (max 10000 entries per chunk)
+6. Stores snapshot and chunks as dag-json using Kubo CLI
+7. Saves metadata to `snapshots/latest.json`
 
-**Critical**: Must use `dag-json` codec to preserve IPLD link semantics for CAR export.
+**Critical Implementation Notes**:
+- Must use `dag-json` codec to preserve IPLD link semantics
+- **Must store `chain_cid` as IPLD link** `{"/": $chain_cid}` so CAR export includes chain entries
+- Chain entries are required for `/entities` endpoint to work after restore
+- Without IPLD link format, chain entry blocks are not included in CAR file
 
 **Output**:
 ```
@@ -148,7 +179,7 @@ Note: dag-json CIDs start with `baguqee...` prefix.
 
 ### 2. Export CAR (`scripts/export-car.sh`)
 
-**Purpose**: Export snapshot to portable CAR file
+**Purpose**: Export snapshot to portable CAR file with all linked blocks
 
 **Usage**:
 ```bash
@@ -157,9 +188,16 @@ Note: dag-json CIDs start with `baguqee...` prefix.
 
 **What it does**:
 1. Reads latest snapshot CID from `snapshots/latest.json`
-2. Exports using `ipfs dag export <SNAPSHOT_CID>`
-3. Saves to `backups/arke-<seq>-<timestamp>.car`
-4. Creates metadata file `backups/arke-<seq>-<timestamp>.json`
+2. Exports using `ipfs dag export <SNAPSHOT_CID>` with 60s timeout
+3. Follows all IPLD links to include: snapshot chunks, manifests, components, **and chain entries**
+4. Validates CAR file was created and has content
+5. Saves to `backups/arke-<seq>-<timestamp>.car`
+6. Creates metadata file with snapshot CID for restore
+
+**Timeout Handling**:
+- Uses `timeout 60s` wrapper as `ipfs dag export` may not exit cleanly
+- Validates file existence and size instead of relying on command exit code
+- Typical small archives export in < 5 seconds
 
 **Output**:
 ```
@@ -167,12 +205,19 @@ Note: dag-json CIDs start with `baguqee...` prefix.
 CAR Export Complete
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Snapshot:  baguqeeraz...
-Sequence:  1
-File:      arke-1-20251009-123456.car
-Size:      1.2 MB
-Location:  ./backups/arke-1-20251009-123456.car
+Sequence:  2
+File:      arke-2-20251012-030530.car
+Size:      1.8 KB
+Location:  ./backups/arke-2-20251012-030530.car
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
+
+**What's included in CAR**:
+- Snapshot root and all chunks (linked list)
+- All entity manifests (current versions)
+- All historical manifests (via `prev` links)
+- All components (metadata, images, files)
+- **All chain entries** (via `chain_cid` IPLD links) ← Required for `/entities` endpoint
 
 ---
 
@@ -180,7 +225,7 @@ Location:  ./backups/arke-1-20251009-123456.car
 
 **⚠️ Important**: This script has been thoroughly tested with the "nuclear option" (complete data destruction and restoration from CAR alone). All logging outputs to stderr to avoid contaminating function return values.
 
-**Purpose**: Restore on fresh node from CAR file alone
+**Purpose**: Restore complete system on fresh node from CAR file alone
 
 **Usage**:
 ```bash
@@ -190,33 +235,49 @@ Location:  ./backups/arke-1-20251009-123456.car
 **Examples**:
 ```bash
 # Automatic (reads snapshot CID from metadata)
-./scripts/restore-from-car.sh backups/arke-1-20251009-123456.car
+./scripts/restore-from-car.sh backups/arke-2-20251012-030530.car
 
 # Manual (provide snapshot CID explicitly)
-./scripts/restore-from-car.sh backups/arke-1-20251009-123456.car bafyreiabc123...
+./scripts/restore-from-car.sh backups/arke-2-20251012-030530.car baguqeeraz...
 ```
 
 **What it does**:
-1. Imports CAR file (`ipfs dag import`)
-2. Fetches snapshot object
-3. For each entry in snapshot:
-   - Creates MFS directory with proper sharding (`/arke/index/01/K7/`)
-   - Writes `.tip` file pointing to manifest CID
-4. Verifies all tips match snapshot
+1. Imports CAR file with `ipfs dag import --stats` (60s timeout)
+2. Fetches snapshot root and walks linked list of chunks
+3. For each entry: creates MFS directory and writes `.tip` file
+4. **Rebuilds index pointer** with preserved `recent_chain_head`
+5. Verifies all unique PIs have corresponding `.tip` files
+
+**Critical: Chain Head Preservation**:
+- Extracts `chain_cid` from last snapshot entry (newest operation)
+- Creates `/arke/index-pointer` with `recent_chain_head` set to this CID
+- This enables `/entities` endpoint to work immediately after restore
+- Without this, entity listing would return empty results
+
+**Timeout Handling**:
+- Uses `timeout 60s` for import as command may not exit cleanly
+- Parses import stats from output logs instead of relying on exit code
 
 **Output**:
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Restoration Complete
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Snapshot:   baguqeeraz... (seq 1)
-Entities:   4
+Snapshot:   baguqeeraz... (seq 2)
+Entities:   3
 MFS:        /arke/index
 Status:     ✓ All verified
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 System restored from CAR file! Ready to serve requests.
 ```
+
+**What gets restored**:
+- All `.tip` files in MFS with proper sharding
+- Index pointer with `recent_chain_head` (enables `/entities` endpoint)
+- All manifests (current + historical versions)
+- All components (metadata, images, files)
+- All chain entries (entity operation history)
 
 ---
 
@@ -475,6 +536,7 @@ See `DR_TEST.md` for step-by-step nuclear test procedure.
 - IPFS node not running
 - `.tip` file unreadable
 - Manifest CID invalid
+- `.env` file has inline comments (breaks bash parsing)
 
 **Fix**:
 ```bash
@@ -486,18 +548,26 @@ docker compose logs ipfs
 
 # Verify MFS structure
 curl -X POST http://localhost:5001/api/v0/files/ls?arg=/arke/index
+
+# Check .env format (comments must be on separate lines)
+cat .env
+# WRONG: CHUNK_SIZE=10000  # comment
+# CORRECT:
+# # comment
+# CHUNK_SIZE=10000
 ```
 
 ---
 
-### CAR Export Fails
+### CAR Export Hangs or Times Out
 
-**Symptom**: `export-car.sh` produces empty or corrupt file
+**Symptom**: `export-car.sh` hangs for 60+ seconds or produces empty file
 
 **Possible causes**:
+- `ipfs dag export` command not exiting cleanly
 - Snapshot CID not pinned
 - Disk full
-- IPFS daemon crashed
+- IPFS daemon unresponsive
 
 **Fix**:
 ```bash
@@ -508,9 +578,48 @@ curl -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID"
 # Check disk space
 df -h
 
-# Try manual export
-docker exec ipfs-node ipfs dag export $SNAP_CID > test.car
+# Try manual export with timeout
+timeout 60s docker exec ipfs-node ipfs dag export "$SNAP_CID" > test.car || true
+ls -lh test.car  # Check if file was created despite timeout
+
+# Check IPFS daemon health
+docker compose logs ipfs --tail 50
+curl -X POST http://localhost:5001/api/v0/version
 ```
+
+**Note**: The timeout is expected behavior. The script validates file creation and size instead of relying on command exit code.
+
+---
+
+### /entities Endpoint Returns Empty After Restore
+
+**Symptom**: After CAR restore, `/entities` endpoint returns `[]` even though `.tip` files exist
+
+**Root Cause**: Chain entry CIDs were stored as plain strings, not IPLD links
+
+**Debug**:
+```bash
+# Check if recent_chain_head exists in index pointer
+curl -X POST http://localhost:5001/api/v0/files/read?arg=/arke/index-pointer | jq .
+
+# Try to fetch chain head CID
+CHAIN_HEAD="baguqee..."  # from index pointer
+curl -sf -X POST "http://localhost:5001/api/v0/dag/get?arg=$CHAIN_HEAD"
+# If this times out or returns error: chain entry block is missing!
+```
+
+**Fix**:
+1. Check `build-snapshot.sh` line ~88 - must use IPLD link format:
+   ```bash
+   # WRONG:
+   chain_cid: $chain_cid
+
+   # CORRECT:
+   chain_cid: {"/": $chain_cid}
+   ```
+2. Rebuild snapshot with corrected script
+3. Export new CAR
+4. Restore again - chain entries will now be included
 
 ---
 
@@ -520,20 +629,24 @@ docker exec ipfs-node ipfs dag export $SNAP_CID > test.car
 
 **Possible causes**:
 - CAR file truncated
-- Import failed partway
-- Snapshot object incomplete
+- Import timed out before completion
+- Snapshot chunk links broken
 
 **Fix**:
 ```bash
 # Re-import with stats
-docker exec ipfs-node ipfs dag import --stats /path/to/car
+timeout 60s docker exec ipfs-node ipfs dag import --stats /path/to/car
 
-# Check snapshot object
-curl -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq '.entries | length'
+# Check snapshot object and walk chunks
+SNAP_CID=$(jq -r '.cid' snapshots/latest.json)
+curl -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq .
 
-# Manually verify each entry
-curl -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq -r '.entries[].tip["/"]' | while read cid; do
-  curl -sf -X POST "http://localhost:5001/api/v0/dag/get?arg=$cid" || echo "Missing: $cid"
+# Verify chunk chain
+CHUNK_CID=$(curl -s -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq -r '.entries_head["/"]')
+while [[ -n "$CHUNK_CID" && "$CHUNK_CID" != "null" ]]; do
+  echo "Checking chunk: $CHUNK_CID"
+  curl -sf -X POST "http://localhost:5001/api/v0/dag/get?arg=$CHUNK_CID" || echo "MISSING!"
+  CHUNK_CID=$(curl -s -X POST "http://localhost:5001/api/v0/dag/get?arg=$CHUNK_CID" | jq -r '.prev["/"] // empty')
 done
 ```
 
@@ -576,7 +689,12 @@ done
 
 ---
 
-**Last Updated**: 2025-10-10
+**Last Updated**: 2025-10-12
 **Maintained By**: Arke Institute
 
-**Tested**: Nuclear test completed successfully on 2025-10-10 - complete data destruction and restoration from CAR verified.
+**Tested**: Nuclear test completed successfully on 2025-10-12 with the following critical verifications:
+- Complete data destruction and restoration from CAR file
+- Chain head preservation through export/import cycle
+- `/entities` endpoint functionality after restore (validates chain entries included)
+- IPLD link format requirement for `chain_cid` field confirmed
+- Timeout handling for `ipfs dag export/import` commands validated

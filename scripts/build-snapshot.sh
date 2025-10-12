@@ -4,11 +4,29 @@
 
 set -euo pipefail
 
-IPFS_API="${IPFS_API:-http://localhost:5001/api/v0}"
+# Load configuration from .env file (if exists), but don't override existing env vars
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/../.env"
+
+if [[ -f "$ENV_FILE" ]]; then
+  # Source .env file, but only set variables that aren't already set
+  while IFS='=' read -r key value; do
+    # Skip comments and empty lines
+    [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
+    # Only set if not already set
+    if [[ -z "${!key:-}" ]]; then
+      export "$key=$value"
+    fi
+  done < <(grep -v '^#' "$ENV_FILE" | grep -v '^$')
+fi
+
+# Configuration (env vars take precedence over .env, then defaults)
+IPFS_API="${IPFS_API_URL:-http://localhost:5001/api/v0}"
 CONTAINER_NAME="${CONTAINER_NAME:-ipfs-node}"
 CHUNK_SIZE="${CHUNK_SIZE:-10000}"
 SNAPSHOTS_DIR="${SNAPSHOTS_DIR:-./snapshots}"
-INDEX_POINTER_PATH="/arke/index-pointer"
+INDEX_POINTER_PATH="${INDEX_POINTER_PATH:-/arke/index-pointer}"
+AUTO_CLEANUP="${AUTO_CLEANUP:-true}"
 
 # Colors
 GREEN='\033[0;32m'
@@ -60,12 +78,14 @@ walk_chain() {
     log "  [$count] $pi (ver $ver)"
 
     # Add to entries array
+    # IMPORTANT: Store the chain CID as an IPLD link so CAR export includes it!
     local new_entry=$(jq -n \
       --arg pi "$pi" \
       --argjson ver "$ver" \
       --arg tip "$tip" \
       --arg ts "$ts" \
-      '{pi: $pi, ver: $ver, tip: {"/": $tip}, ts: $ts}')
+      --arg chain_cid "$current" \
+      '{pi: $pi, ver: $ver, tip: {"/": $tip}, ts: $ts, chain_cid: {"/": $chain_cid}}')
 
     entries=$(echo "$entries" | jq --argjson entry "$new_entry" '. = [$entry] + .')
 
@@ -123,43 +143,62 @@ get_snapshot_entries() {
   echo "$all_entries"
 }
 
-# Create chunks from entries array
+# Create chunks as a linked list (chain-style)
+# Returns the CID of the HEAD chunk (most recent)
 create_chunks() {
   local entries="$1"
   local total=$(echo "$entries" | jq 'length')
-  local chunks="[]"
-  local chunk_idx=0
+  local prev_chunk_cid=""
+  local chunk_count=0
 
-  log "Creating chunks (size=$CHUNK_SIZE) from $total entries..."
+  log "Creating chunk linked list (size=$CHUNK_SIZE) from $total entries..."
 
-  local offset=0
-  while [[ $offset -lt $total ]]; do
-    # Extract chunk of entries
-    local chunk_entries=$(echo "$entries" | jq --argjson offset "$offset" --argjson size "$CHUNK_SIZE" \
+  # Build chunks from OLDEST to NEWEST (so we can link backwards)
+  local offset=$((total - total % CHUNK_SIZE))
+  if [[ $offset -eq $total && $total -gt 0 ]]; then
+    offset=$((offset - CHUNK_SIZE))
+  fi
+
+  # Process chunks in reverse order (oldest first)
+  local chunk_cids=()
+  local temp_offset=0
+  while [[ $temp_offset -lt $total ]]; do
+    local chunk_entries=$(echo "$entries" | jq --argjson offset "$temp_offset" --argjson size "$CHUNK_SIZE" \
       '.[$offset:($offset + $size)]')
 
-    # Create chunk object
+    local chunk_idx=$((temp_offset / CHUNK_SIZE))
+
+    # Create chunk object with prev link
+    local prev_link="null"
+    if [[ -n "$prev_chunk_cid" ]]; then
+      prev_link=$(jq -n --arg cid "$prev_chunk_cid" '{"/": $cid}')
+    fi
+
     local chunk_obj=$(jq -n \
-      --arg schema "arke/snapshot-chunk@v1" \
+      --arg schema "arke/snapshot-chunk@v2" \
       --argjson chunk_index "$chunk_idx" \
       --argjson entries "$chunk_entries" \
-      '{schema: $schema, chunk_index: $chunk_index, entries: $entries}')
+      --argjson prev "$prev_link" \
+      '{schema: $schema, chunk_index: $chunk_index, entries: $entries, prev: $prev}')
 
     # Store chunk as DAG-JSON
-    local chunk_cid=$(echo "$chunk_obj" | docker exec -i "$CONTAINER_NAME" \
-      ipfs dag put --store-codec=dag-json --input-codec=json --pin=true 2>&1 | tr -d '[:space:]')
+    # Use HTTP API instead of docker exec (for container compatibility)
+    local chunk_cid=$(echo "$chunk_obj" | curl -sf -X POST \
+      -F "file=@-" \
+      "$IPFS_API/dag/put?store-codec=dag-json&input-codec=json&pin=true" | \
+      jq -r '.Cid["/"]' 2>&1 | tr -d '[:space:]')
 
     log "  Chunk $chunk_idx: $chunk_cid ($(echo "$chunk_entries" | jq 'length') entries)"
 
-    # Add to chunks array
-    chunks=$(echo "$chunks" | jq --arg cid "$chunk_cid" '. += [{"/": $cid}]')
-
-    offset=$((offset + CHUNK_SIZE))
-    chunk_idx=$((chunk_idx + 1))
+    prev_chunk_cid="$chunk_cid"
+    chunk_count=$((chunk_count + 1))
+    temp_offset=$((temp_offset + CHUNK_SIZE))
   done
 
-  success "Created $chunk_idx chunks"
-  echo "$chunks"
+  success "Created $chunk_count chunks in linked list"
+
+  # Return the HEAD (last chunk created, which is the newest)
+  echo "$prev_chunk_cid"
 }
 
 # Main snapshot build logic
@@ -201,23 +240,28 @@ build_snapshot() {
     error "No entries to snapshot"
   fi
 
-  # Create chunks
-  local chunks=$(create_chunks "$all_entries")
+  # Create chunk linked list (returns head CID)
+  local chunks_head_cid=$(create_chunks "$all_entries")
 
-  # Create snapshot object
+  # Create snapshot object with entries_head
   local prev_link="null"
   if [[ -n "$prev_snapshot" && "$prev_snapshot" != "null" ]]; then
     prev_link=$(jq -n --arg cid "$prev_snapshot" '{"/": $cid}')
   fi
 
+  local entries_head_link="null"
+  if [[ -n "$chunks_head_cid" && "$chunks_head_cid" != "null" ]]; then
+    entries_head_link=$(jq -n --arg cid "$chunks_head_cid" '{"/": $cid}')
+  fi
+
   local snapshot=$(jq -n \
-    --arg schema "arke/snapshot@v2" \
+    --arg schema "arke/snapshot@v3" \
     --argjson seq "$new_seq" \
     --arg ts "$timestamp" \
     --argjson prev "$prev_link" \
     --argjson total "$total_count" \
     --argjson chunk_size "$CHUNK_SIZE" \
-    --argjson chunks "$chunks" \
+    --argjson entries_head "$entries_head_link" \
     '{
       schema: $schema,
       seq: $seq,
@@ -225,17 +269,30 @@ build_snapshot() {
       prev_snapshot: $prev,
       total_count: $total,
       chunk_size: $chunk_size,
-      chunks: $chunks
+      entries_head: $entries_head
     }')
 
   log "Storing snapshot metadata..."
-  local snapshot_cid=$(echo "$snapshot" | docker exec -i "$CONTAINER_NAME" \
-    ipfs dag put --store-codec=dag-json --input-codec=json --pin=true 2>&1 | tr -d '[:space:]')
+  # Use HTTP API instead of docker exec (for container compatibility)
+  local snapshot_cid=$(echo "$snapshot" | curl -sf -X POST \
+    -F "file=@-" \
+    "$IPFS_API/dag/put?store-codec=dag-json&input-codec=json&pin=true" | \
+    jq -r '.Cid["/"]' 2>&1 | tr -d '[:space:]')
 
   success "Snapshot created: $snapshot_cid"
 
   # Update index pointer
-  log "Updating index pointer..."
+  # IMPORTANT: Keep recent_chain_head pointing to the latest entity!
+  # This maintains chain continuity - new entities link to it via prev.
+  # Only recent_count resets to 0 (meaning: no new entities since snapshot).
+  log "Updating index pointer (preserving chain head)..."
+
+  # Build chain_head value (null if empty, otherwise the CID)
+  local chain_head_value="null"
+  if [[ -n "$chain_head" && "$chain_head" != "null" ]]; then
+    chain_head_value="\"$chain_head\""
+  fi
+
   local new_pointer=$(jq -n \
     --arg schema "arke/index-pointer@v1" \
     --arg snapshot_cid "$snapshot_cid" \
@@ -243,13 +300,14 @@ build_snapshot() {
     --argjson count "$total_count" \
     --arg ts "$timestamp" \
     --arg updated "$timestamp" \
+    --argjson chain_head "$chain_head_value" \
     '{
       schema: $schema,
       latest_snapshot_cid: $snapshot_cid,
       snapshot_seq: $seq,
       snapshot_count: $count,
       snapshot_ts: $ts,
-      recent_chain_head: null,
+      recent_chain_head: $chain_head,
       recent_count: 0,
       total_count: $count,
       last_updated: $updated
@@ -274,6 +332,17 @@ build_snapshot() {
 
   success "Snapshot metadata saved"
 
+  # Run automatic pin cleanup
+  if [[ "$AUTO_CLEANUP" == "true" ]]; then
+    log "Running automatic pin cleanup..."
+    local script_dir=$(dirname "$0")
+    if [[ -x "$script_dir/cleanup-old-snapshots.sh" ]]; then
+      "$script_dir/cleanup-old-snapshots.sh" || warn "Pin cleanup failed (non-fatal)"
+    else
+      warn "Cleanup script not found or not executable: $script_dir/cleanup-old-snapshots.sh"
+    fi
+  fi
+
   # Summary
   echo "" >&2
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
@@ -282,7 +351,6 @@ build_snapshot() {
   echo "CID:      $snapshot_cid" >&2
   echo "Sequence: $new_seq" >&2
   echo "Entities: $total_count" >&2
-  echo "Chunks:   $(echo "$chunks" | jq 'length')" >&2
   echo "Time:     $timestamp" >&2
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
   echo "" >&2
@@ -292,10 +360,7 @@ build_snapshot() {
 
 # Main
 main() {
-  if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-    error "Docker container '$CONTAINER_NAME' is not running"
-  fi
-
+  # Check IPFS availability (skip docker check if running inside container)
   if ! curl -sf -X POST "$IPFS_API/version" > /dev/null; then
     error "Cannot connect to IPFS at $IPFS_API"
   fi

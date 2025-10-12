@@ -1,12 +1,17 @@
 from pydantic_settings import BaseSettings
+from pydantic import ConfigDict
 
 class Settings(BaseSettings):
-    IPFS_API_URL: str = "http://localhost:5001/api/v0"
-    INDEX_POINTER_PATH: str = "/arke/index-pointer"
-    CHUNK_SIZE: int = 10000
-    REBUILD_THRESHOLD: int = 10000  # Rebuild snapshot every N new items
+    # Configuration values used by the API
+    IPFS_API_URL: str
+    INDEX_POINTER_PATH: str
+    CHUNK_SIZE: int
+    REBUILD_THRESHOLD: int
+    AUTO_SNAPSHOT: bool
 
-    class Config:
-        env_file = ".env"
+    model_config = ConfigDict(
+        env_file=".env",
+        extra="ignore"  # Ignore extra fields in .env (used by scripts)
+    )
 
 settings = Settings()

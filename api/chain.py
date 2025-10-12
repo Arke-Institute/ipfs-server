@@ -4,6 +4,9 @@ from config import settings
 from models import ChainEntry, IndexPointer
 import index_pointer
 import json
+import subprocess
+import os
+from pathlib import Path
 
 async def append_to_chain(pi: str, tip_cid: str, ver: int) -> str:
     """
@@ -14,6 +17,7 @@ async def append_to_chain(pi: str, tip_cid: str, ver: int) -> str:
     pointer = await index_pointer.get_index_pointer()
 
     # 2. Create new chain entry
+    # Link to recent_chain_head (which is never reset, so chain stays continuous)
     entry = ChainEntry(
         pi=pi,
         ver=ver,
@@ -48,11 +52,32 @@ async def append_to_chain(pi: str, tip_cid: str, ver: int) -> str:
     pointer.total_count += 1
     await index_pointer.update_index_pointer(pointer)
 
-    # 5. Check if rebuild needed
+    # 5. Check if rebuild needed and auto-trigger
     if pointer.recent_count >= settings.REBUILD_THRESHOLD:
-        # Trigger background snapshot rebuild
-        # (Could use task queue, webhook, or just log warning)
-        print(f"WARNING: Recent chain has {pointer.recent_count} items. Rebuild recommended.")
+        print(f"⚠️  Threshold reached: {pointer.recent_count}/{settings.REBUILD_THRESHOLD} entities")
+
+        if settings.AUTO_SNAPSHOT:
+            print("🔄 Triggering automatic snapshot build...")
+
+            # Path to build-snapshot.sh script (inside container: /app/scripts/)
+            script_path = "/app/scripts/build-snapshot.sh"
+
+            # Trigger snapshot build in background (fire-and-forget)
+            try:
+                subprocess.Popen(
+                    [script_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd="/app",
+                    env={
+                        **os.environ,
+                        "CONTAINER_NAME": "ipfs-node",
+                        "IPFS_API_URL": settings.IPFS_API_URL  # Pass the correct API URL for internal docker networking
+                    }
+                )
+                print("✅ Snapshot build triggered in background")
+            except Exception as e:
+                print(f"❌ Failed to trigger snapshot build: {e}")
 
     return new_cid
 

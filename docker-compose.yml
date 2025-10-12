@@ -28,8 +28,16 @@ services:
     container_name: ipfs-api
     ports:
       - "3000:3000"
+    env_file:
+      - .env
     environment:
+      # Override IPFS_API_URL for internal Docker networking
       - IPFS_API_URL=http://ipfs:5001/api/v0
+    volumes:
+      - ./scripts:/app/scripts:ro   # Mount scripts for snapshot triggering
+      - ./snapshots:/app/snapshots  # Mount snapshots directory
+      - ./backups:/app/backups      # Mount backups directory
+      - ./.env:/app/.env:ro         # Mount .env for scripts
     depends_on:
       - ipfs
     restart: unless-stopped

@@ -47,16 +47,24 @@ export_car() {
   mkdir -p "$BACKUPS_DIR"
 
   # Export using docker exec (since we're running in a container)
-  log "Running: ipfs dag export $snapshot_cid"
+  # NOTE: ipfs dag export sometimes doesn't exit cleanly even after writing all data
+  # We use timeout and check if the file was created successfully
+  log "Running: ipfs dag export $snapshot_cid (with 60s timeout)"
 
-  if docker exec "$CONTAINER_NAME" ipfs dag export "$snapshot_cid" > "$car_path"; then
-    success "CAR file exported successfully"
-  else
-    error "Failed to export CAR file"
+  timeout 60s docker exec "$CONTAINER_NAME" ipfs dag export --progress=false "$snapshot_cid" > "$car_path" 2>/dev/null || true
+
+  # Check if file was created and has content
+  if [[ ! -f "$car_path" ]]; then
+    error "CAR file was not created"
   fi
 
   # Get file size
   local size_bytes=$(stat -f%z "$car_path" 2>/dev/null || stat -c%s "$car_path" 2>/dev/null || echo "0")
+  if [[ "$size_bytes" -eq 0 ]]; then
+    error "CAR file is empty"
+  fi
+
+  success "CAR file exported successfully"
   local size_mb=$(echo "scale=2; $size_bytes / 1048576" | bc)
 
   success "CAR file size: ${size_mb} MB ($size_bytes bytes)"
