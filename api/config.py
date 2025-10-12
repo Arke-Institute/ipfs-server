@@ -5,9 +5,8 @@ class Settings(BaseSettings):
     # Configuration values used by the API
     IPFS_API_URL: str
     INDEX_POINTER_PATH: str
-    CHUNK_SIZE: int
-    REBUILD_THRESHOLD: int
-    AUTO_SNAPSHOT: bool
+    SNAPSHOT_INTERVAL_MINUTES: int = 60  # Default: 1 hour
+    AUTO_SNAPSHOT: bool = True
 
     model_config = ConfigDict(
         env_file=".env",

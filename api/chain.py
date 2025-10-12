@@ -50,33 +50,6 @@ async def append_to_chain(pi: str) -> str:
     pointer.total_count += 1
     await index_pointer.update_index_pointer(pointer)
 
-    # 5. Check if rebuild needed and auto-trigger
-    if pointer.recent_count >= settings.REBUILD_THRESHOLD:
-        print(f"⚠️  Threshold reached: {pointer.recent_count}/{settings.REBUILD_THRESHOLD} entities")
-
-        if settings.AUTO_SNAPSHOT:
-            print("🔄 Triggering automatic snapshot build...")
-
-            # Path to build-snapshot.sh script (inside container: /app/scripts/)
-            script_path = "/app/scripts/build-snapshot.sh"
-
-            # Trigger snapshot build in background (fire-and-forget)
-            try:
-                subprocess.Popen(
-                    [script_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    cwd="/app",
-                    env={
-                        **os.environ,
-                        "CONTAINER_NAME": "ipfs-node",
-                        "IPFS_API_URL": settings.IPFS_API_URL  # Pass the correct API URL for internal docker networking
-                    }
-                )
-                print("✅ Snapshot build triggered in background")
-            except Exception as e:
-                print(f"❌ Failed to trigger snapshot build: {e}")
-
     return new_cid
 
 async def query_chain(limit: int = 10, cursor: str | None = None) -> tuple[list[dict], str | None]:
@@ -143,3 +116,60 @@ async def query_chain(limit: int = 10, cursor: str | None = None) -> tuple[list[
 
         # More items available
         return items, current_cid
+
+async def trigger_scheduled_snapshot():
+    """
+    Triggered by scheduler every N minutes.
+    Builds a snapshot if there are entities and no build is already in progress.
+    """
+    # Check if lock file exists (snapshot already building)
+    lock_file = Path("/tmp/arke-snapshot.lock")
+    if lock_file.exists():
+        print("⏳ Snapshot build already in progress (lock file exists), skipping scheduled trigger")
+        return
+
+    # Get current state
+    pointer = await index_pointer.get_index_pointer()
+
+    # Skip if no entities exist
+    if pointer.total_count == 0:
+        print("ℹ️  No entities to snapshot, skipping scheduled trigger")
+        return
+
+    print(f"⏰ Scheduled snapshot trigger (total: {pointer.total_count}, recent: {pointer.recent_count})")
+
+    # Path to build-snapshot.sh script (inside container: /app/scripts/)
+    script_path = "/app/scripts/build-snapshot.sh"
+    log_path = "/app/logs/snapshot-build.log"
+
+    # Ensure logs directory exists
+    Path("/app/logs").mkdir(exist_ok=True)
+
+    # Update trigger timestamp
+    trigger_time = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    pointer.last_snapshot_trigger = trigger_time
+    await index_pointer.update_index_pointer(pointer)
+
+    # Trigger snapshot build in background (fire-and-forget)
+    try:
+        with open(log_path, 'a') as log_file:
+            log_file.write(f"\n{'='*60}\n")
+            log_file.write(f"[SCHEDULED] Snapshot build triggered at {trigger_time}\n")
+            log_file.write(f"Total entities: {pointer.total_count}\n")
+            log_file.write(f"Recent count: {pointer.recent_count}\n")
+            log_file.write(f"{'='*60}\n\n")
+
+            subprocess.Popen(
+                [script_path],
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                cwd="/app",
+                env={
+                    **os.environ,
+                    "CONTAINER_NAME": "ipfs-node",
+                    "IPFS_API_URL": settings.IPFS_API_URL
+                }
+            )
+        print(f"✅ Snapshot build triggered in background (logging to {log_path})")
+    except Exception as e:
+        print(f"❌ Failed to trigger snapshot build: {e}")

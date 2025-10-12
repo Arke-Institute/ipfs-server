@@ -28,6 +28,7 @@ async def get_index_pointer() -> IndexPointer:
                 recent_chain_head=None,
                 recent_count=0,
                 total_count=0,
+                last_snapshot_trigger=None,
                 last_updated=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
             )
         raise

@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+# Lock file to prevent concurrent builds
+LOCK_FILE="/tmp/arke-snapshot.lock"
+
 # Load configuration from .env file (if exists), but don't override existing env vars
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/../.env"
@@ -122,6 +125,7 @@ walk_chain() {
 
 # Main snapshot build logic
 build_snapshot() {
+  local start_time=$(date +%s)
   local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
   log "Reading index pointer..."
@@ -245,6 +249,10 @@ build_snapshot() {
     fi
   fi
 
+  # Calculate duration
+  local end_time=$(date +%s)
+  local duration=$((end_time - start_time))
+
   # Summary
   echo "" >&2
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
@@ -254,6 +262,7 @@ build_snapshot() {
   echo "Sequence: $new_seq" >&2
   echo "Entities: $total_count" >&2
   echo "Time:     $timestamp" >&2
+  echo "Duration: ${duration}s" >&2
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
   echo "" >&2
 
@@ -262,6 +271,25 @@ build_snapshot() {
 
 # Main
 main() {
+  # Check for existing lock file
+  if [[ -f "$LOCK_FILE" ]]; then
+    local lock_age=$(($(date +%s) - $(stat -f %m "$LOCK_FILE" 2>/dev/null || stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0)))
+
+    # If lock is older than 10 minutes, it's probably stale (crashed build)
+    if [[ $lock_age -lt 600 ]]; then
+      error "Snapshot build already in progress (lock file exists: $LOCK_FILE)"
+    else
+      warn "Removing stale lock file (age: ${lock_age}s)"
+      rm -f "$LOCK_FILE"
+    fi
+  fi
+
+  # Create lock file with PID and timestamp
+  echo "$$|$(date +%s)" > "$LOCK_FILE"
+
+  # Ensure lock is removed on exit (success or failure)
+  trap "rm -f $LOCK_FILE" EXIT
+
   # Check IPFS availability (skip docker check if running inside container)
   if ! curl -sf -X POST "$IPFS_API/version" > /dev/null; then
     error "Cannot connect to IPFS at $IPFS_API"

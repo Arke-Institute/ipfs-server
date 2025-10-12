@@ -12,6 +12,7 @@ class IndexPointer(BaseModel):
     recent_chain_head: Optional[str] = None  # Always points to the latest entity (never reset to null)
     recent_count: int = 0  # Number of new entities since last snapshot
     total_count: int = 0
+    last_snapshot_trigger: Optional[str] = None  # Timestamp when snapshot was last triggered (prevents rapid re-triggers)
     last_updated: str
 
 class ChainEntry(BaseModel):

@@ -1,10 +1,15 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from config import settings
 import index_pointer
 import chain
 from models import EntitiesResponse, AppendChainRequest
 
 app = FastAPI(title="Arke IPFS Index API", version="1.0.0")
+
+# Scheduler for time-based snapshot triggers
+scheduler = AsyncIOScheduler()
 
 app.add_middleware(
     CORSMiddleware,
@@ -87,3 +92,29 @@ async def rebuild_snapshot():
     # This will be implemented via the shell script
     # For now, return a placeholder
     return {"message": "Snapshot rebuild should be triggered via build-snapshot.sh script"}
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize scheduler on startup."""
+    if settings.AUTO_SNAPSHOT:
+        interval = settings.SNAPSHOT_INTERVAL_MINUTES
+        print(f"🕐 Starting snapshot scheduler (every {interval} minutes)")
+
+        scheduler.add_job(
+            chain.trigger_scheduled_snapshot,
+            'interval',
+            minutes=interval,
+            id='snapshot_builder',
+            replace_existing=True
+        )
+        scheduler.start()
+        print(f"✅ Snapshot scheduler started")
+    else:
+        print("ℹ️  Auto-snapshot disabled (AUTO_SNAPSHOT=false)")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Shutdown scheduler on app shutdown."""
+    if scheduler.running:
+        scheduler.shutdown()
+        print("🛑 Snapshot scheduler stopped")
