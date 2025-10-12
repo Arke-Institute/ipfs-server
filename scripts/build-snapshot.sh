@@ -157,25 +157,25 @@ build_snapshot() {
   fi
 
   # Create snapshot object with entries array (no chunking)
+  # IMPORTANT: Use stdin for entries to avoid "Argument list too long" error with 1000+ entities
   local prev_link="null"
   if [[ -n "$prev_snapshot" && "$prev_snapshot" != "null" ]]; then
     prev_link=$(jq -n --arg cid "$prev_snapshot" '{"/": $cid}')
   fi
 
-  local snapshot=$(jq -n \
+  local snapshot=$(echo "$all_entries" | jq \
     --arg schema "arke/snapshot@v0" \
     --argjson seq "$new_seq" \
     --arg ts "$timestamp" \
     --argjson prev "$prev_link" \
     --argjson total "$total_count" \
-    --argjson entries "$all_entries" \
     '{
       schema: $schema,
       seq: $seq,
       ts: $ts,
       prev_snapshot: $prev,
       total_count: $total,
-      entries: $entries
+      entries: .
     }')
 
   log "Storing snapshot metadata..."
