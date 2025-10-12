@@ -7,50 +7,58 @@ import json
 import subprocess
 import os
 from pathlib import Path
+import asyncio
+
+# Global lock to prevent race conditions during chain append operations
+_chain_append_lock = asyncio.Lock()
 
 async def append_to_chain(pi: str) -> str:
     """
     Append a new PI to the recent chain.
     Chain is just an ordered list of PIs - tip/version info is in MFS.
     Returns the new chain entry CID.
+
+    Uses a lock to prevent race conditions when multiple concurrent requests
+    try to append to the chain simultaneously.
     """
-    # 1. Get current index pointer
-    pointer = await index_pointer.get_index_pointer()
+    async with _chain_append_lock:
+        # 1. Get current index pointer
+        pointer = await index_pointer.get_index_pointer()
 
-    # 2. Create new chain entry (just PI + timestamp + prev link)
-    entry = ChainEntry(
-        pi=pi,
-        ts=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-        prev={"/": pointer.recent_chain_head} if pointer.recent_chain_head else None
-    )
-
-    # 3. Store as DAG-JSON
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{settings.IPFS_API_URL}/dag/put",
-            params={
-                "store-codec": "dag-json",
-                "input-codec": "json",
-                "pin": "true"
-            },
-            files={"file": ("entry.json", entry.model_dump_json().encode(), "application/json")},
-            timeout=10.0
+        # 2. Create new chain entry (just PI + timestamp + prev link)
+        entry = ChainEntry(
+            pi=pi,
+            ts=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            prev={"/": pointer.recent_chain_head} if pointer.recent_chain_head else None
         )
-        response.raise_for_status()
 
-        # Parse the response to get the CID
-        result_text = response.text.strip()
-        # The response is a JSON object with Cid field
-        result = json.loads(result_text)
-        new_cid = result["Cid"]["/"]
+        # 3. Store as DAG-JSON
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{settings.IPFS_API_URL}/dag/put",
+                params={
+                    "store-codec": "dag-json",
+                    "input-codec": "json",
+                    "pin": "true"
+                },
+                files={"file": ("entry.json", entry.model_dump_json().encode(), "application/json")},
+                timeout=10.0
+            )
+            response.raise_for_status()
 
-    # 4. Update index pointer
-    pointer.recent_chain_head = new_cid
-    pointer.recent_count += 1
-    pointer.total_count += 1
-    await index_pointer.update_index_pointer(pointer)
+            # Parse the response to get the CID
+            result_text = response.text.strip()
+            # The response is a JSON object with Cid field
+            result = json.loads(result_text)
+            new_cid = result["Cid"]["/"]
 
-    return new_cid
+        # 4. Update index pointer
+        pointer.recent_chain_head = new_cid
+        pointer.recent_count += 1
+        pointer.total_count += 1
+        await index_pointer.update_index_pointer(pointer)
+
+        return new_cid
 
 async def query_chain(limit: int = 10, cursor: str | None = None) -> tuple[list[dict], str | None]:
     """
