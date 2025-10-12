@@ -36,6 +36,37 @@ services:
           cpus: '1'
           memory: 1G
 
+  ipfs-api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: ipfs-api-prod
+    ports:
+      - "127.0.0.1:3000:3000"  # Localhost only
+    environment:
+      - IPFS_API_URL=http://ipfs:5001/api/v0
+    depends_on:
+      - ipfs
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
 volumes:
   ipfs_data:
     driver: local

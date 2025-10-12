@@ -113,11 +113,10 @@ get_snapshot() {
   fi
 
   local schema=$(echo "$snapshot" | jq -r '.schema // ""')
-  if [[ "$schema" != "arke/snapshot-index@v1" && "$schema" != "arke/snapshot@v2" ]]; then
-    error "Invalid snapshot schema: $schema (expected arke/snapshot-index@v1 or arke/snapshot@v2)"
+  if [[ "$schema" != "arke/snapshot-index@v1" ]]; then
+    error "Invalid snapshot schema: $schema (expected arke/snapshot-index@v1)"
   fi
 
-  log "Snapshot schema: $schema"
   echo "$snapshot"
 }
 
@@ -127,39 +126,6 @@ shard_path() {
   local shard1="${pi:0:2}"
   local shard2="${pi:2:2}"
   echo "$INDEX_ROOT/$shard1/$shard2"
-}
-
-# Get all entries from snapshot (handles both v1 and v2)
-get_snapshot_entries() {
-  local snapshot="$1"
-  local schema=$(echo "$snapshot" | jq -r '.schema')
-
-  if [[ "$schema" == "arke/snapshot-index@v1" ]]; then
-    # V1: entries are directly in snapshot
-    echo "$snapshot" | jq '.entries'
-  elif [[ "$schema" == "arke/snapshot@v2" ]]; then
-    # V2: entries are in chunks
-    log "Fetching chunked snapshot entries..."
-    local chunks=$(echo "$snapshot" | jq -r '.chunks')
-    local chunk_count=$(echo "$chunks" | jq 'length')
-    local all_entries="[]"
-
-    for i in $(seq 0 $((chunk_count - 1))); do
-      local chunk_cid=$(echo "$chunks" | jq -r ".[$i][\"/\"]")
-      log "  Fetching chunk $i: $chunk_cid"
-
-      local chunk=$(curl -sf -X POST "$IPFS_API/dag/get?arg=$chunk_cid" 2>/dev/null)
-      local chunk_entries=$(echo "$chunk" | jq '.entries')
-
-      all_entries=$(echo "$all_entries" | jq --argjson chunk "$chunk_entries" '. + $chunk')
-    done
-
-    local total=$(echo "$all_entries" | jq 'length')
-    success "Loaded $total entries from $chunk_count chunks"
-    echo "$all_entries"
-  else
-    error "Unknown snapshot schema: $schema"
-  fi
 }
 
 # Create .tip file in MFS
@@ -191,9 +157,8 @@ rebuild_mfs() {
 
   log "Rebuilding MFS structure from snapshot..."
 
-  # Get entries (handles both v1 and v2)
-  local entries=$(get_snapshot_entries "$snapshot")
-  local count=$(echo "$entries" | jq 'length')
+  # Use array indexing instead of streaming (more reliable)
+  local count=$(echo "$snapshot" | jq -r '.entries | length')
   local seq=$(echo "$snapshot" | jq -r '.seq')
   local ts=$(echo "$snapshot" | jq -r '.ts')
 
@@ -210,9 +175,9 @@ rebuild_mfs() {
 
   # Loop using array indices (avoids streaming issues)
   for i in $(seq 0 $((count - 1))); do
-    local pi=$(echo "$entries" | jq -r ".[$i].pi")
-    local tip_cid=$(echo "$entries" | jq -r ".[$i].tip[\"/\"]")
-    local ver=$(echo "$entries" | jq -r ".[$i].ver")
+    local pi=$(echo "$snapshot" | jq -r ".entries[$i].pi")
+    local tip_cid=$(echo "$snapshot" | jq -r ".entries[$i].tip[\"/\"]")
+    local ver=$(echo "$snapshot" | jq -r ".entries[$i].ver")
 
     # Validate we got real values
     if [[ -z "$pi" ]] || [[ "$pi" == "null" ]]; then
@@ -239,15 +204,13 @@ verify_restoration() {
 
   log "Verifying restoration..."
 
-  # Get entries (handles both v1 and v2)
-  local entries=$(get_snapshot_entries "$snapshot")
-  local count=$(echo "$entries" | jq 'length')
+  local count=$(echo "$snapshot" | jq -r '.entries | length')
   local errors=0
 
   # Use array indexing for verification too
   for i in $(seq 0 $((count - 1))); do
-    local pi=$(echo "$entries" | jq -r ".[$i].pi")
-    local expected_tip=$(echo "$entries" | jq -r ".[$i].tip[\"/\"]")
+    local pi=$(echo "$snapshot" | jq -r ".entries[$i].pi")
+    local expected_tip=$(echo "$snapshot" | jq -r ".entries[$i].tip[\"/\"]")
 
     # Skip if invalid
     if [[ -z "$pi" ]] || [[ "$pi" == "null" ]]; then
@@ -273,53 +236,6 @@ verify_restoration() {
     error "$errors verification errors found"
     return 1
   fi
-}
-
-# Restore index pointer for v2 snapshots
-restore_index_pointer() {
-  local snapshot_cid="$1"
-  local snapshot="$2"
-
-  local schema=$(echo "$snapshot" | jq -r '.schema')
-
-  # Only restore for v2 snapshots
-  if [[ "$schema" != "arke/snapshot@v2" ]]; then
-    log "Skipping index pointer restore (not a v2 snapshot)"
-    return 0
-  fi
-
-  log "Restoring index pointer..."
-
-  local seq=$(echo "$snapshot" | jq -r '.seq')
-  local ts=$(echo "$snapshot" | jq -r '.ts')
-  local total_count=$(echo "$snapshot" | jq -r '.total_count')
-
-  # Create index pointer
-  local index_pointer=$(jq -n \
-    --arg schema "arke/index-pointer@v1" \
-    --arg snapshot_cid "$snapshot_cid" \
-    --argjson seq "$seq" \
-    --argjson count "$total_count" \
-    --arg ts "$ts" \
-    --arg updated "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-    '{
-      schema: $schema,
-      latest_snapshot_cid: $snapshot_cid,
-      snapshot_seq: $seq,
-      snapshot_count: $count,
-      snapshot_ts: $ts,
-      recent_chain_head: null,
-      recent_count: 0,
-      total_count: $count,
-      last_updated: $updated
-    }')
-
-  # Write to MFS
-  echo "$index_pointer" | curl -sf -X POST \
-    -F "file=@-" \
-    "$IPFS_API/files/write?arg=/arke/index-pointer&create=true&truncate=true&parents=true" >/dev/null
-
-  success "Index pointer restored"
 }
 
 # Main
@@ -366,12 +282,8 @@ main() {
   # Verify
   verify_restoration "$snapshot"
 
-  # Restore index pointer (for v2 snapshots)
-  restore_index_pointer "$snapshot_cid" "$snapshot"
-
   # Output summary
-  local entries=$(get_snapshot_entries "$snapshot")
-  local count=$(echo "$entries" | jq 'length')
+  local count=$(echo "$snapshot" | jq '.entries | length')
   local seq=$(echo "$snapshot" | jq -r '.seq')
 
   echo ""

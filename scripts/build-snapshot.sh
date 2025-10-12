@@ -1,222 +1,301 @@
 #!/bin/bash
-# Build snapshot index from all .tip files in MFS
-# Creates a dag-cbor object that serves as the CAR export root
+# Build chunked snapshot from recent chain + previous snapshot
+# NO MFS TRAVERSAL - uses DAG operations only
 
 set -euo pipefail
 
 IPFS_API="${IPFS_API:-http://localhost:5001/api/v0}"
 CONTAINER_NAME="${CONTAINER_NAME:-ipfs-node}"
-INDEX_ROOT="/arke/index"
+CHUNK_SIZE="${CHUNK_SIZE:-10000}"
 SNAPSHOTS_DIR="${SNAPSHOTS_DIR:-./snapshots}"
-PREV_SNAPSHOT=""
+INDEX_POINTER_PATH="/arke/index-pointer"
 
-# Colors for output
-RED='\033[0;31m'
+# Colors
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-log() { echo -e "${BLUE}[INFO]${NC} $*"; }
-success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+log() { echo -e "${BLUE}[INFO]${NC} $*" >&2; }
+success() { echo -e "${GREEN}[SUCCESS]${NC} $*" >&2; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+error() { echo "[ERROR] $*" >&2; exit 1; }
 
-# Get sequence number from previous snapshot
-get_next_seq() {
-  if [[ -f "$SNAPSHOTS_DIR/latest.json" ]]; then
-    local prev_seq=$(jq -r '.seq // 0' "$SNAPSHOTS_DIR/latest.json" 2>/dev/null || echo "0")
-    PREV_SNAPSHOT=$(jq -r '.cid // null' "$SNAPSHOTS_DIR/latest.json" 2>/dev/null || echo "null")
-    echo $((prev_seq + 1))
+# Read index pointer from MFS
+get_index_pointer() {
+  local pointer=$(curl -sf -X POST "$IPFS_API/files/read?arg=$INDEX_POINTER_PATH" 2>/dev/null)
+  if [[ -z "$pointer" ]]; then
+    echo '{}'
   else
-    echo 1
+    echo "$pointer"
   fi
 }
 
-# Recursively find all .tip files in MFS
-find_tip_files() {
-  local path="$1"
-  local tips=()
-
-  # List directory
-  local entries=$(curl -sf -X POST "$IPFS_API/files/ls?arg=$path&long=true" || echo '{"Entries":[]}')
-
-  # Parse entries
-  echo "$entries" | jq -c '.Entries[]?' | while read -r entry; do
-    local name=$(echo "$entry" | jq -r '.Name')
-    local type=$(echo "$entry" | jq -r '.Type')
-    local full_path="$path/$name"
-
-    if [[ $type -eq 1 ]]; then
-      # Directory - recurse
-      find_tip_files "$full_path"
-    elif [[ $name == *.tip ]]; then
-      # Tip file - output path
-      echo "$full_path"
-    fi
-  done
-}
-
-# Read a tip file and get manifest CID
-read_tip() {
-  local tip_path="$1"
-  curl -sf -X POST "$IPFS_API/files/read?arg=$tip_path" | tr -d '\n' || echo ""
-}
-
-# Get manifest from CID
-get_manifest() {
-  local cid="$1"
-  curl -sf -X POST "$IPFS_API/dag/get?arg=$cid" || echo "{}"
-}
-
-# Extract PI from tip file path
-extract_pi() {
-  local tip_path="$1"
-  basename "$tip_path" .tip
-}
-
-# Build snapshot index
-build_snapshot() {
-  log "Building snapshot index..."
-
-  # Get next sequence number
-  local seq=$(get_next_seq)
-  local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-  log "Snapshot sequence: $seq"
-  log "Timestamp: $timestamp"
-
-  # Find all tip files
-  log "Scanning $INDEX_ROOT for .tip files..."
-
-  # Portable alternative to mapfile (works on bash 3+)
-  local tip_files_temp="/tmp/tip_files_$$.txt"
-  find_tip_files "$INDEX_ROOT" > "$tip_files_temp"
-
-  local count=$(wc -l < "$tip_files_temp" | tr -d ' ')
-  if [[ $count -eq 0 ]]; then
-    rm -f "$tip_files_temp"
-    error "No .tip files found in $INDEX_ROOT"
-  fi
-
-  success "Found $count .tip files"
-
-  # Build entries array
+# Walk recent chain and collect all entries
+walk_chain() {
+  local chain_head="$1"
   local entries="[]"
-  local i=0
+  local current="$chain_head"
+  local count=0
 
-  while IFS= read -r tip_path; do
-    i=$((i + 1))
-    local pi=$(extract_pi "$tip_path")
+  log "Walking recent chain from $chain_head..."
 
-    log "[$i/$count] Processing $pi..."
+  while [[ -n "$current" && "$current" != "null" ]]; do
+    count=$((count + 1))
 
-    # Read tip CID
-    local tip_cid=$(read_tip "$tip_path")
-    if [[ -z "$tip_cid" ]]; then
-      warn "Failed to read tip for $pi, skipping"
-      continue
+    # Fetch chain entry
+    local entry=$(curl -sf -X POST "$IPFS_API/dag/get?arg=$current" 2>/dev/null)
+
+    if [[ -z "$entry" ]]; then
+      warn "Failed to fetch chain entry $current, stopping"
+      break
     fi
 
-    # Get manifest to extract version
-    local manifest=$(get_manifest "$tip_cid")
-    local ver=$(echo "$manifest" | jq -r '.ver // 0')
+    # Extract data
+    local pi=$(echo "$entry" | jq -r '.pi')
+    local ver=$(echo "$entry" | jq -r '.ver')
+    local tip=$(echo "$entry" | jq -r '.tip["/"]')
+    local ts=$(echo "$entry" | jq -r '.ts')
 
-    if [[ $ver -eq 0 ]]; then
-      warn "Failed to get manifest for $pi (CID: $tip_cid), skipping"
-      continue
-    fi
+    log "  [$count] $pi (ver $ver)"
 
-    log "  PI: $pi | Ver: $ver | Tip: $tip_cid"
-
-    # Add entry
-    local entry=$(jq -n \
+    # Add to entries array
+    local new_entry=$(jq -n \
       --arg pi "$pi" \
       --argjson ver "$ver" \
-      --arg tip "$tip_cid" \
-      '{pi: $pi, ver: $ver, tip: {"/": $tip}}')
+      --arg tip "$tip" \
+      --arg ts "$ts" \
+      '{pi: $pi, ver: $ver, tip: {"/": $tip}, ts: $ts}')
 
-    entries=$(echo "$entries" | jq --argjson entry "$entry" '. += [$entry]')
-  done < "$tip_files_temp"
+    entries=$(echo "$entries" | jq --argjson entry "$new_entry" '. = [$entry] + .')
 
-  # Clean up temp file
-  rm -f "$tip_files_temp"
+    # Move to previous
+    local prev=$(echo "$entry" | jq -r '.prev["/"] // empty')
+    if [[ -z "$prev" ]]; then
+      break
+    fi
+    current="$prev"
+  done
 
-  local final_count=$(echo "$entries" | jq 'length')
-  success "Collected $final_count entries"
+  success "Collected $count entries from chain"
+  echo "$entries"
+}
 
-  # Build snapshot object
+# Read previous snapshot entries
+get_snapshot_entries() {
+  local snapshot_cid="$1"
+
+  if [[ -z "$snapshot_cid" || "$snapshot_cid" == "null" ]]; then
+    echo "[]"
+    return
+  fi
+
+  log "Reading previous snapshot $snapshot_cid..."
+
+  # Fetch snapshot metadata
+  local snapshot=$(curl -sf -X POST "$IPFS_API/dag/get?arg=$snapshot_cid" 2>/dev/null)
+
+  if [[ -z "$snapshot" ]]; then
+    warn "Failed to fetch snapshot, starting fresh"
+    echo "[]"
+    return
+  fi
+
+  local all_entries="[]"
+  local chunk_count=$(echo "$snapshot" | jq -r '.chunks | length')
+
+  log "Snapshot has $chunk_count chunks"
+
+  # Fetch all chunks
+  for i in $(seq 0 $((chunk_count - 1))); do
+    local chunk_cid=$(echo "$snapshot" | jq -r ".chunks[$i][\"/\"]")
+    log "  Fetching chunk $i: $chunk_cid"
+
+    local chunk=$(curl -sf -X POST "$IPFS_API/dag/get?arg=$chunk_cid" 2>/dev/null)
+    local chunk_entries=$(echo "$chunk" | jq '.entries')
+
+    all_entries=$(echo "$all_entries" | jq --argjson chunk "$chunk_entries" '. + $chunk')
+  done
+
+  local total=$(echo "$all_entries" | jq 'length')
+  success "Loaded $total entries from previous snapshot"
+
+  echo "$all_entries"
+}
+
+# Create chunks from entries array
+create_chunks() {
+  local entries="$1"
+  local total=$(echo "$entries" | jq 'length')
+  local chunks="[]"
+  local chunk_idx=0
+
+  log "Creating chunks (size=$CHUNK_SIZE) from $total entries..."
+
+  local offset=0
+  while [[ $offset -lt $total ]]; do
+    # Extract chunk of entries
+    local chunk_entries=$(echo "$entries" | jq --argjson offset "$offset" --argjson size "$CHUNK_SIZE" \
+      '.[$offset:($offset + $size)]')
+
+    # Create chunk object
+    local chunk_obj=$(jq -n \
+      --arg schema "arke/snapshot-chunk@v1" \
+      --argjson chunk_index "$chunk_idx" \
+      --argjson entries "$chunk_entries" \
+      '{schema: $schema, chunk_index: $chunk_index, entries: $entries}')
+
+    # Store chunk as DAG-JSON
+    local chunk_cid=$(echo "$chunk_obj" | docker exec -i "$CONTAINER_NAME" \
+      ipfs dag put --store-codec=dag-json --input-codec=json --pin=true 2>&1 | tr -d '[:space:]')
+
+    log "  Chunk $chunk_idx: $chunk_cid ($(echo "$chunk_entries" | jq 'length') entries)"
+
+    # Add to chunks array
+    chunks=$(echo "$chunks" | jq --arg cid "$chunk_cid" '. += [{"/": $cid}]')
+
+    offset=$((offset + CHUNK_SIZE))
+    chunk_idx=$((chunk_idx + 1))
+  done
+
+  success "Created $chunk_idx chunks"
+  echo "$chunks"
+}
+
+# Main snapshot build logic
+build_snapshot() {
+  local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  log "Reading index pointer..."
+  local pointer=$(get_index_pointer)
+
+  local prev_snapshot=$(echo "$pointer" | jq -r '.latest_snapshot_cid // empty')
+  local prev_seq=$(echo "$pointer" | jq -r '.snapshot_seq // 0')
+  local chain_head=$(echo "$pointer" | jq -r '.recent_chain_head // empty')
+
+  local new_seq=$((prev_seq + 1))
+
+  log "Previous snapshot: ${prev_snapshot:-none}"
+  log "Chain head: ${chain_head:-none}"
+  log "New sequence: $new_seq"
+
+  # Collect all entries
+  local chain_entries="[]"
+  if [[ -n "$chain_head" && "$chain_head" != "null" ]]; then
+    chain_entries=$(walk_chain "$chain_head")
+  fi
+
+  local snapshot_entries="[]"
+  if [[ -n "$prev_snapshot" && "$prev_snapshot" != "null" ]]; then
+    snapshot_entries=$(get_snapshot_entries "$prev_snapshot")
+  fi
+
+  # Merge: chain entries (newest) + snapshot entries (oldest)
+  log "Merging entries..."
+  local all_entries=$(echo "$chain_entries" "$snapshot_entries" | jq -s '.[0] + .[1]')
+  local total_count=$(echo "$all_entries" | jq 'length')
+
+  success "Total entries to snapshot: $total_count"
+
+  if [[ $total_count -eq 0 ]]; then
+    error "No entries to snapshot"
+  fi
+
+  # Create chunks
+  local chunks=$(create_chunks "$all_entries")
+
+  # Create snapshot object
   local prev_link="null"
-  if [[ "$PREV_SNAPSHOT" != "null" && -n "$PREV_SNAPSHOT" ]]; then
-    prev_link=$(jq -n --arg cid "$PREV_SNAPSHOT" '{"/": $cid}')
-    log "Linking to previous snapshot: $PREV_SNAPSHOT"
+  if [[ -n "$prev_snapshot" && "$prev_snapshot" != "null" ]]; then
+    prev_link=$(jq -n --arg cid "$prev_snapshot" '{"/": $cid}')
   fi
 
   local snapshot=$(jq -n \
-    --arg schema "arke/snapshot-index@v1" \
-    --argjson seq "$seq" \
+    --arg schema "arke/snapshot@v2" \
+    --argjson seq "$new_seq" \
     --arg ts "$timestamp" \
     --argjson prev "$prev_link" \
-    --argjson entries "$entries" \
-    '{schema: $schema, seq: $seq, ts: $ts, prev: $prev, entries: $entries}')
+    --argjson total "$total_count" \
+    --argjson chunk_size "$CHUNK_SIZE" \
+    --argjson chunks "$chunks" \
+    '{
+      schema: $schema,
+      seq: $seq,
+      ts: $ts,
+      prev_snapshot: $prev,
+      total_count: $total,
+      chunk_size: $chunk_size,
+      chunks: $chunks
+    }')
 
-  log "Snapshot object created ($(echo "$snapshot" | jq -c . | wc -c) bytes)"
-
-  # Store as dag-json (preserves IPLD links for CAR export)
-  log "Storing snapshot as dag-json..."
-  # Use CLI instead of HTTP API because it properly handles IPLD links
+  log "Storing snapshot metadata..."
   local snapshot_cid=$(echo "$snapshot" | docker exec -i "$CONTAINER_NAME" \
-    ipfs dag put --store-codec=dag-json --input-codec=json --pin=true)
+    ipfs dag put --store-codec=dag-json --input-codec=json --pin=true 2>&1 | tr -d '[:space:]')
 
-  # Remove any whitespace
-  snapshot_cid=$(echo "$snapshot_cid" | tr -d '[:space:]')
+  success "Snapshot created: $snapshot_cid"
 
-  if [[ -z "$snapshot_cid" || "$snapshot_cid" == "null" ]]; then
-    error "Failed to store snapshot"
-  fi
+  # Update index pointer
+  log "Updating index pointer..."
+  local new_pointer=$(jq -n \
+    --arg schema "arke/index-pointer@v1" \
+    --arg snapshot_cid "$snapshot_cid" \
+    --argjson seq "$new_seq" \
+    --argjson count "$total_count" \
+    --arg ts "$timestamp" \
+    --arg updated "$timestamp" \
+    '{
+      schema: $schema,
+      latest_snapshot_cid: $snapshot_cid,
+      snapshot_seq: $seq,
+      snapshot_count: $count,
+      snapshot_ts: $ts,
+      recent_chain_head: null,
+      recent_count: 0,
+      total_count: $count,
+      last_updated: $updated
+    }')
 
-  success "Snapshot stored: $snapshot_cid"
+  # Write to MFS
+  echo "$new_pointer" | curl -sf -X POST \
+    -F "file=@-" \
+    "$IPFS_API/files/write?arg=$INDEX_POINTER_PATH&create=true&truncate=true&parents=true" >/dev/null
 
   # Save metadata
   mkdir -p "$SNAPSHOTS_DIR"
   local metadata=$(jq -n \
     --arg cid "$snapshot_cid" \
-    --argjson seq "$seq" \
+    --argjson seq "$new_seq" \
     --arg ts "$timestamp" \
-    --argjson count "$final_count" \
+    --argjson count "$total_count" \
     '{cid: $cid, seq: $seq, ts: $ts, count: $count}')
 
-  echo "$metadata" > "$SNAPSHOTS_DIR/snapshot-$seq.json"
+  echo "$metadata" > "$SNAPSHOTS_DIR/snapshot-$new_seq.json"
   echo "$metadata" > "$SNAPSHOTS_DIR/latest.json"
 
-  success "Snapshot metadata saved to $SNAPSHOTS_DIR"
+  success "Snapshot metadata saved"
 
-  # Output summary
-  echo ""
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo -e "${GREEN}Snapshot Build Complete${NC}"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "CID:      $snapshot_cid"
-  echo "Sequence: $seq"
-  echo "Entities: $final_count"
-  echo "Time:     $timestamp"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo ""
+  # Summary
+  echo "" >&2
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+  echo -e "${GREEN}Snapshot Build Complete${NC}" >&2
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+  echo "CID:      $snapshot_cid" >&2
+  echo "Sequence: $new_seq" >&2
+  echo "Entities: $total_count" >&2
+  echo "Chunks:   $(echo "$chunks" | jq 'length')" >&2
+  echo "Time:     $timestamp" >&2
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+  echo "" >&2
 
-  # Output the CID for piping
   echo "$snapshot_cid"
 }
 
 # Main
 main() {
-  log "Starting snapshot builder..."
-
-  # Check if docker container is running
   if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     error "Docker container '$CONTAINER_NAME' is not running"
   fi
 
-  # Check if IPFS is accessible
   if ! curl -sf -X POST "$IPFS_API/version" > /dev/null; then
     error "Cannot connect to IPFS at $IPFS_API"
   fi
