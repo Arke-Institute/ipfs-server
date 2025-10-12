@@ -62,72 +62,68 @@ The DR strategy is built around **snapshot-based CAR exports** that capture:
 
 ## Data Model
 
-### Snapshot Index (dag-json) - v3
+### Snapshot Index (dag-json) - v0
 
-**Current Schema**: v3 uses linked list of chunks for scalability
+**Current Schema**: v0 uses direct array for simplicity
 
 ```json
 {
-  "schema": "arke/snapshot@v3",
+  "schema": "arke/snapshot@v0",
   "seq": 42,
   "ts": "2025-10-12T03:05:24Z",
   "prev_snapshot": { "/": "baguqee...SNAP41" },  // link to previous snapshot (optional)
-  "chunk_size": 10000,
   "total_count": 3,
-  "entries_head": { "/": "baguqee...CHUNK_HEAD" }  // link to newest chunk
-}
-```
-
-**Snapshot Chunk** (linked list node):
-```json
-{
-  "schema": "arke/snapshot-chunk@v2",
-  "chunk_index": 0,
-  "prev": { "/": "baguqee...PREV_CHUNK" },  // link to older chunk (null for tail)
   "entries": [
     {
       "pi": "ENTITY_1",
       "ver": 2,
-      "tip": { "/": "bafyrei..." },
-      "chain_cid": { "/": "baguqee..." },  // ⚠️ CRITICAL: Must be IPLD link!
+      "tip_cid": { "/": "bafyrei..." },       // IPLD link to manifest
+      "chain_cid": { "/": "baguqee..." },     // IPLD link to chain entry
       "ts": "2025-10-12T03:05:17.769678Z"
+    },
+    {
+      "pi": "ENTITY_2",
+      "ver": 1,
+      "tip_cid": { "/": "bafyrei..." },
+      "chain_cid": { "/": "baguqee..." },
+      "ts": "2025-10-12T03:05:18.123456Z"
     }
   ]
 }
 ```
 
 **Fields**:
-- `schema`: Always `"arke/snapshot@v3"` for snapshot root
+- `schema`: Always `"arke/snapshot@v0"` for snapshot root
 - `seq`: Monotonically increasing snapshot number (1, 2, 3, ...)
 - `ts`: ISO 8601 timestamp of snapshot creation
 - `prev_snapshot`: IPLD link to previous snapshot (for chaining; null for first)
-- `chunk_size`: Maximum entries per chunk (default: 10000)
-- `total_count`: Total entities across all chunks
-- `entries_head`: IPLD link to most recent chunk (walk backwards via `prev`)
-- **`chain_cid`**: ⚠️ **CRITICAL** - Must be IPLD link format `{"/": "cid"}`, NOT plain string
+- `total_count`: Total entities in entries array
+- `entries`: Direct array of all entity snapshots (no chunking)
+- **`tip_cid`**: ⚠️ **CRITICAL** - Must be IPLD link format `{"/": "cid"}` for CAR export
+- **`chain_cid`**: ⚠️ **CRITICAL** - Must be IPLD link format `{"/": "cid"}` for CAR export
 
 **Why dag-json and IPLD Links?**
 
 **Critical**: The snapshot MUST be stored as `dag-json` (not `dag-cbor`) to ensure IPLD links are properly preserved for CAR export.
 
 Using `{"/": "cid"}` format with dag-json ensures CAR exporters follow links and include:
-- All tip manifests (via `tip` field)
+- All tip manifests (via `tip_cid` field)
 - All historical manifests (via `prev` links in manifests)
 - All components (metadata, files, images)
 - **All chain entries** (via `chain_cid` field) ⚠️ **CRITICAL FOR /entities ENDPOINT**
 
 **⚠️ IPLD Link Requirement**:
 ```bash
-# WRONG - plain string (chain entries NOT included in CAR):
+# WRONG - plain string (blocks NOT included in CAR):
+"tip_cid": "bafyrei..."
 "chain_cid": "baguqee..."
 
-# CORRECT - IPLD link (chain entries included in CAR):
+# CORRECT - IPLD link (blocks included in CAR):
+"tip_cid": {"/": "bafyrei..."}
 "chain_cid": {"/": "baguqee..."}
 ```
 
 The CAR exporter ONLY follows IPLD links in `{"/": "cid"}` format. Plain string CIDs are stored but not followed, causing missing blocks after restore.
-
-**Important Implementation Detail**: Use the Kubo CLI (`ipfs dag put --store-codec=dag-json`) instead of the HTTP API, as the HTTP API's dag-cbor encoding doesn't preserve IPLD link semantics correctly.
 
 ---
 
@@ -145,17 +141,18 @@ The CAR exporter ONLY follows IPLD links in `{"/": "cid"}` format. Plain string 
 **What it does**:
 1. Reads current index pointer from `/arke/index-pointer`
 2. Walks the PI chain from `recent_chain_head` to collect all entities
-3. For each entity: reads `.tip` file, fetches manifest for version number
-4. **CRITICAL**: Stores `chain_cid` as IPLD link `{"/": $chain_cid}` (not plain string)
-5. Creates linked list of snapshot chunks (max 10000 entries per chunk)
-6. Stores snapshot and chunks as dag-json using Kubo CLI
+3. For each entity: reads `.tip` file from MFS, fetches manifest for version number
+4. **CRITICAL**: Stores both `tip_cid` and `chain_cid` as IPLD links `{"/": $cid}` (not plain strings)
+5. Creates snapshot object with direct entries array (no chunking)
+6. Stores snapshot as dag-json using HTTP API
 7. Saves metadata to `snapshots/latest.json`
 
 **Critical Implementation Notes**:
 - Must use `dag-json` codec to preserve IPLD link semantics
-- **Must store `chain_cid` as IPLD link** `{"/": $chain_cid}` so CAR export includes chain entries
+- **Must store `tip_cid` and `chain_cid` as IPLD links** so CAR export includes all blocks
 - Chain entries are required for `/entities` endpoint to work after restore
-- Without IPLD link format, chain entry blocks are not included in CAR file
+- Tip manifests are required for entity version history
+- Without IPLD link format, blocks are not included in CAR file
 
 **Output**:
 ```
@@ -189,7 +186,7 @@ Note: dag-json CIDs start with `baguqee...` prefix.
 **What it does**:
 1. Reads latest snapshot CID from `snapshots/latest.json`
 2. Exports using `ipfs dag export <SNAPSHOT_CID>` with 60s timeout
-3. Follows all IPLD links to include: snapshot chunks, manifests, components, **and chain entries**
+3. Follows all IPLD links to include: manifests (via `tip_cid`), components, **and chain entries (via `chain_cid`)**
 4. Validates CAR file was created and has content
 5. Saves to `backups/arke-<seq>-<timestamp>.car`
 6. Creates metadata file with snapshot CID for restore
@@ -213,9 +210,9 @@ Location:  ./backups/arke-2-20251012-030530.car
 ```
 
 **What's included in CAR**:
-- Snapshot root and all chunks (linked list)
-- All entity manifests (current versions)
-- All historical manifests (via `prev` links)
+- Snapshot root with direct entries array
+- All entity manifests (current versions via `tip_cid` links)
+- All historical manifests (via `prev` links in manifests)
 - All components (metadata, images, files)
 - **All chain entries** (via `chain_cid` IPLD links) ← Required for `/entities` endpoint
 
@@ -243,7 +240,7 @@ Location:  ./backups/arke-2-20251012-030530.car
 
 **What it does**:
 1. Imports CAR file with `ipfs dag import --stats` (60s timeout)
-2. Fetches snapshot root and walks linked list of chunks
+2. Fetches snapshot root and reads entries array directly (no chunk walking)
 3. For each entry: creates MFS directory and writes `.tip` file
 4. **Rebuilds index pointer** with preserved `recent_chain_head`
 5. Verifies all unique PIs have corresponding `.tip` files
@@ -609,17 +606,19 @@ curl -sf -X POST "http://localhost:5001/api/v0/dag/get?arg=$CHAIN_HEAD"
 ```
 
 **Fix**:
-1. Check `build-snapshot.sh` line ~88 - must use IPLD link format:
+1. Check `build-snapshot.sh` line ~105 - must use IPLD link format:
    ```bash
    # WRONG:
-   chain_cid: $chain_cid
+   "tip_cid": "$tip_cid",
+   "chain_cid": "$chain_cid"
 
    # CORRECT:
-   chain_cid: {"/": $chain_cid}
+   "tip_cid": {"/": "$tip_cid"},
+   "chain_cid": {"/": "$chain_cid"}
    ```
 2. Rebuild snapshot with corrected script
 3. Export new CAR
-4. Restore again - chain entries will now be included
+4. Restore again - all blocks will now be included
 
 ---
 
@@ -630,24 +629,20 @@ curl -sf -X POST "http://localhost:5001/api/v0/dag/get?arg=$CHAIN_HEAD"
 **Possible causes**:
 - CAR file truncated
 - Import timed out before completion
-- Snapshot chunk links broken
+- Snapshot entries array malformed
 
 **Fix**:
 ```bash
 # Re-import with stats
 timeout 60s docker exec ipfs-node ipfs dag import --stats /path/to/car
 
-# Check snapshot object and walk chunks
+# Check snapshot object
 SNAP_CID=$(jq -r '.cid' snapshots/latest.json)
 curl -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq .
 
-# Verify chunk chain
-CHUNK_CID=$(curl -s -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq -r '.entries_head["/"]')
-while [[ -n "$CHUNK_CID" && "$CHUNK_CID" != "null" ]]; do
-  echo "Checking chunk: $CHUNK_CID"
-  curl -sf -X POST "http://localhost:5001/api/v0/dag/get?arg=$CHUNK_CID" || echo "MISSING!"
-  CHUNK_CID=$(curl -s -X POST "http://localhost:5001/api/v0/dag/get?arg=$CHUNK_CID" | jq -r '.prev["/"] // empty')
-done
+# Verify entries array
+curl -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq '.entries | length'
+curl -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq '.entries[] | {pi, ver}'
 ```
 
 ---

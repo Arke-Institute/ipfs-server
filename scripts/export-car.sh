@@ -46,7 +46,10 @@ export_car() {
   # Create backups directory
   mkdir -p "$BACKUPS_DIR"
 
-  # Export using docker exec (since we're running in a container)
+  # Export using docker exec
+  # CAR exporter automatically follows IPLD links in snapshot:
+  # - entries[] → tip_cid (manifests + version history)
+  # - entries[] → chain_cid (chain entries for /entities pagination)
   # NOTE: ipfs dag export sometimes doesn't exit cleanly even after writing all data
   # We use timeout and check if the file was created successfully
   log "Running: ipfs dag export $snapshot_cid (with 60s timeout)"

@@ -135,14 +135,22 @@ curl -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq .
 echo "$SNAP_CID" | grep -q '^baguqee' && echo "✓ dag-json format" || echo "✗ Wrong format!"
 ```
 
-**⚠️ CRITICAL: Verify chain_cid is IPLD link format**:
+**⚠️ CRITICAL: Verify chain_cid and tip_cid are IPLD link format**:
 ```bash
-# Fetch a snapshot chunk and verify chain_cid format
-CHUNK_CID=$(curl -s -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq -r '.entries_head["/"]')
-curl -X POST "http://localhost:5001/api/v0/dag/get?arg=$CHUNK_CID" | jq '.entries[0].chain_cid'
+# Fetch snapshot and verify field formats
+curl -X POST "http://localhost:5001/api/v0/dag/get?arg=$SNAP_CID" | jq '.entries[0] | {tip_cid, chain_cid}'
 
-# Expected: {"/": "baguqee..."}  ✓ CORRECT
-# NOT:      "baguqee..."          ✗ WRONG - chain entries won't be in CAR!
+# Expected:
+# {
+#   "tip_cid": {"/": "bafyrei..."},     ✓ CORRECT
+#   "chain_cid": {"/": "baguqee..."}    ✓ CORRECT
+# }
+#
+# NOT:
+# {
+#   "tip_cid": "bafyrei...",            ✗ WRONG - manifests won't be in CAR!
+#   "chain_cid": "baguqee..."           ✗ WRONG - chain entries won't be in CAR!
+# }
 ```
 
 ### Step 2.2: Export CAR
@@ -537,7 +545,7 @@ done
 | 1.2 | Record sample entity | ☐ Pass ☐ Fail |
 | 1.3 | Verify version history | ☐ Pass ☐ Fail |
 | 2.1 | Build snapshot | ☐ Pass ☐ Fail |
-| 2.1b | **Verify chain_cid IPLD format** | ☐ Pass ☐ Fail |
+| 2.1b | **Verify tip_cid & chain_cid IPLD format** | ☐ Pass ☐ Fail |
 | 2.2 | Export CAR | ☐ Pass ☐ Fail |
 | 3.2 | **Delete volumes (nuclear)** | ☐ Completed |
 | 4.1 | Restore from CAR | ☐ Pass ☐ Fail |
@@ -613,13 +621,18 @@ curl -sf -X POST "http://localhost:5001/api/v0/dag/get?arg=<CHAIN_HEAD_CID>"
 ```
 
 **Fix**:
-1. Check `build-snapshot.sh` around line 88
-2. Ensure it uses: `chain_cid: {"/": $chain_cid}` NOT `chain_cid: $chain_cid`
+1. Check `build-snapshot.sh` around line 105
+2. Ensure it uses IPLD link format for BOTH fields:
+   ```bash
+   # CORRECT:
+   "tip_cid": {"/": "$tip_cid"},
+   "chain_cid": {"/": "$chain_cid"}
+   ```
 3. Rebuild snapshot
 4. Re-export CAR
 5. Restore again
 
-**Prevention**: Always verify chain_cid format in Step 2.1b before export
+**Prevention**: Always verify tip_cid and chain_cid format in Step 2.1b before export
 
 ---
 
@@ -657,7 +670,7 @@ After successful test:
 **Actual Test Results** (2025-10-12):
 - Complete data destruction confirmed (all volumes deleted)
 - Clean environment: 3 fresh test entities (ENTITY_1, ENTITY_2, ENTITY_3)
-- Snapshot build: v3 schema with linked list chunks
+- Snapshot build: v0 schema with direct entries array (no chunking)
 - CAR export: 1.8 KB (6 blocks total)
 - CAR import: 6 blocks restored
 - MFS rebuild: automatic, no manual intervention
@@ -668,24 +681,33 @@ After successful test:
 - System fully operational after restore
 
 **Key Learnings**:
-1. **CRITICAL**: `chain_cid` MUST be stored as IPLD link `{"/": $cid}` NOT plain string
-   - Plain string format: CAR export doesn't follow link → chain entry blocks not included
-   - IPLD link format: CAR export follows link → chain entry blocks included
+1. **CRITICAL**: Both `tip_cid` and `chain_cid` MUST be stored as IPLD links `{"/": $cid}` NOT plain strings
+   - Plain string format: CAR export doesn't follow link → blocks not included
+   - IPLD link format: CAR export follows link → all blocks included
+   - Without tip manifests, entity version history is lost
    - Without chain entries, `/entities` endpoint returns empty after restore
 2. dag-json codec is critical for IPLD link preservation
-3. Timeout handling required for `ipfs dag export/import` (commands don't exit cleanly)
-4. File validation (existence + size) more reliable than command exit codes
-5. `.env` file inline comments break bash arithmetic parsing
-6. Logging to stderr prevents stdout contamination in bash functions
-7. MFS must be rebuilt from snapshot (not included in CAR)
-8. Index pointer must be recreated with `recent_chain_head` from last snapshot entry
-9. Single CAR file contains complete system state for full recovery
+3. Direct array simpler than chunked linked list (removed 125 lines of complexity)
+4. Timeout handling required for `ipfs dag export/import` (commands don't exit cleanly)
+5. File validation (existence + size) more reliable than command exit codes
+6. `.env` file inline comments break bash arithmetic parsing
+7. Logging to stderr prevents stdout contamination in bash functions
+8. MFS must be rebuilt from snapshot (not included in CAR)
+9. Index pointer must be recreated with `recent_chain_head` from last snapshot entry
+10. Single CAR file contains complete system state for full recovery
 
 **Critical Implementation Detail**:
 The `recent_chain_head` preservation was the primary goal of the 2025-10-12 test. Without it, the `/entities` endpoint (which walks the PI chain) would not function after disaster recovery. The fix required:
 - Adding `chain_cid` field to snapshot entries
 - Storing it as IPLD link format so CAR exporter includes the blocks
 - Extracting it during restore to populate index pointer
+
+**Architecture Simplification** (2025-10-12):
+- Removed snapshot chunking (v3 → v0)
+- Changed from linked list to direct array in snapshot object
+- Simplified restore logic from ~40 lines to 3 lines
+- Removed chunk walking from cleanup script
+- Snapshots now faster (one dag put instead of N chunks)
 
 ---
 

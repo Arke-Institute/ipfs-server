@@ -31,6 +31,7 @@ get_current_snapshot_cid() {
 # Main cleanup logic
 cleanup_old_snapshots() {
   log "Starting snapshot pin cleanup (keep last $KEEP_LAST snapshots)..."
+  log "Note: Only snapshot roots unpinned; chain entries and tip manifests preserved"
 
   # Check if snapshots directory exists
   if [[ ! -d "$SNAPSHOTS_DIR" ]]; then
@@ -70,7 +71,7 @@ cleanup_old_snapshots() {
 
   log "Will unpin and remove $delete_count old snapshots"
 
-  # Unpin old snapshots
+  # Unpin old snapshots (just the root CIDs, no chunks)
   local unpinned=0
   local skipped=0
   local failed=0
@@ -91,6 +92,7 @@ cleanup_old_snapshots() {
       continue
     fi
 
+    # Unpin snapshot root
     if [[ "$DRY_RUN" == "true" ]]; then
       log "[DRY RUN] Would unpin snapshot $snapshot_cid (seq $snapshot_seq)"
     else
@@ -98,21 +100,18 @@ cleanup_old_snapshots() {
 
       if docker exec "$CONTAINER_NAME" ipfs pin rm "$snapshot_cid" 2>/dev/null; then
         ((unpinned++))
-
-        # Remove metadata file
         rm -f "$snapshot_file"
         success "Unpinned and removed snapshot $snapshot_seq"
       else
         warn "Failed to unpin $snapshot_cid (may already be unpinned)"
         ((failed++))
-
-        # Still remove metadata file even if unpin failed
         rm -f "$snapshot_file"
       fi
     fi
   done <<< "$old_snapshots"
 
   success "Cleanup complete: $unpinned unpinned, $skipped skipped, $failed failed"
+  warn "Note: Tip manifests and chain entries NOT unpinned (shared across snapshots)"
 
   # Run garbage collection to reclaim disk space
   if [[ "$DRY_RUN" == "false" && $unpinned -gt 0 ]]; then

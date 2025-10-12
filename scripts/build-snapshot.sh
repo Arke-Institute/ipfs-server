@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build chunked snapshot from recent chain + previous snapshot
-# NO MFS TRAVERSAL - uses DAG operations only
+# Build snapshot from PI chain with current tips from MFS
+# Walks chain, reads current tips from MFS, stores as direct array
 
 set -euo pipefail
 
@@ -23,7 +23,6 @@ fi
 # Configuration (env vars take precedence over .env, then defaults)
 IPFS_API="${IPFS_API_URL:-http://localhost:5001/api/v0}"
 CONTAINER_NAME="${CONTAINER_NAME:-ipfs-node}"
-CHUNK_SIZE="${CHUNK_SIZE:-10000}"
 SNAPSHOTS_DIR="${SNAPSHOTS_DIR:-./snapshots}"
 INDEX_POINTER_PATH="${INDEX_POINTER_PATH:-/arke/index-pointer}"
 AUTO_CLEANUP="${AUTO_CLEANUP:-true}"
@@ -49,19 +48,19 @@ get_index_pointer() {
   fi
 }
 
-# Walk recent chain and collect all entries
+# Walk entire chain and collect all PIs, reading current tips from MFS
 walk_chain() {
   local chain_head="$1"
   local entries="[]"
   local current="$chain_head"
   local count=0
 
-  log "Walking recent chain from $chain_head..."
+  log "Walking entire PI chain from head (reading current tips from MFS)..."
 
   while [[ -n "$current" && "$current" != "null" ]]; do
     count=$((count + 1))
 
-    # Fetch chain entry
+    # Fetch chain entry (just PI + timestamp + prev)
     local entry=$(curl -sf -X POST "$IPFS_API/dag/get?arg=$current" 2>/dev/null)
 
     if [[ -z "$entry" ]]; then
@@ -69,23 +68,41 @@ walk_chain() {
       break
     fi
 
-    # Extract data
+    # Extract PI and timestamp from chain entry
     local pi=$(echo "$entry" | jq -r '.pi')
-    local ver=$(echo "$entry" | jq -r '.ver')
-    local tip=$(echo "$entry" | jq -r '.tip["/"]')
     local ts=$(echo "$entry" | jq -r '.ts')
 
-    log "  [$count] $pi (ver $ver)"
+    # Read CURRENT tip from MFS (not from chain entry)
+    local shard1="${pi:0:2}"
+    local shard2="${pi:2:2}"
+    local tip_path="/arke/index/$shard1/$shard2/${pi}.tip"
 
-    # Add to entries array
-    # IMPORTANT: Store the chain CID as an IPLD link so CAR export includes it!
+    local tip_cid=$(curl -sf -X POST "$IPFS_API/files/read?arg=$tip_path" 2>/dev/null | tr -d '\n')
+
+    if [[ -z "$tip_cid" ]]; then
+      warn "Failed to read tip for $pi, skipping"
+      current=$(echo "$entry" | jq -r '.prev["/"] // empty')
+      continue
+    fi
+
+    # Fetch manifest to get current version number
+    local manifest=$(curl -sf -X POST "$IPFS_API/dag/get?arg=$tip_cid" 2>/dev/null)
+    local ver=$(echo "$manifest" | jq -r '.ver // 0')
+
+    log "  [$count] $pi (v$ver, tip from MFS)"
+
+    # Build snapshot entry
+    # IMPORTANT:
+    # - tip_cid as IPLD LINK so CAR exporter includes manifests + version history
+    # - chain_cid as IPLD LINK so CAR exporter includes chain entries
+    # - Both needed for complete DR restore
     local new_entry=$(jq -n \
       --arg pi "$pi" \
       --argjson ver "$ver" \
-      --arg tip "$tip" \
+      --arg tip_cid "$tip_cid" \
       --arg ts "$ts" \
       --arg chain_cid "$current" \
-      '{pi: $pi, ver: $ver, tip: {"/": $tip}, ts: $ts, chain_cid: {"/": $chain_cid}}')
+      '{pi: $pi, ver: $ver, tip_cid: {"/": $tip_cid}, ts: $ts, chain_cid: {"/": $chain_cid}}')
 
     entries=$(echo "$entries" | jq --argjson entry "$new_entry" '. = [$entry] + .')
 
@@ -97,109 +114,11 @@ walk_chain() {
     current="$prev"
   done
 
-  success "Collected $count entries from chain"
+  success "Collected $count entries from chain (tips read from MFS)"
   echo "$entries"
 }
 
-# Read previous snapshot entries
-get_snapshot_entries() {
-  local snapshot_cid="$1"
-
-  if [[ -z "$snapshot_cid" || "$snapshot_cid" == "null" ]]; then
-    echo "[]"
-    return
-  fi
-
-  log "Reading previous snapshot $snapshot_cid..."
-
-  # Fetch snapshot metadata
-  local snapshot=$(curl -sf -X POST "$IPFS_API/dag/get?arg=$snapshot_cid" 2>/dev/null)
-
-  if [[ -z "$snapshot" ]]; then
-    warn "Failed to fetch snapshot, starting fresh"
-    echo "[]"
-    return
-  fi
-
-  local all_entries="[]"
-  local chunk_count=$(echo "$snapshot" | jq -r '.chunks | length')
-
-  log "Snapshot has $chunk_count chunks"
-
-  # Fetch all chunks
-  for i in $(seq 0 $((chunk_count - 1))); do
-    local chunk_cid=$(echo "$snapshot" | jq -r ".chunks[$i][\"/\"]")
-    log "  Fetching chunk $i: $chunk_cid"
-
-    local chunk=$(curl -sf -X POST "$IPFS_API/dag/get?arg=$chunk_cid" 2>/dev/null)
-    local chunk_entries=$(echo "$chunk" | jq '.entries')
-
-    all_entries=$(echo "$all_entries" | jq --argjson chunk "$chunk_entries" '. + $chunk')
-  done
-
-  local total=$(echo "$all_entries" | jq 'length')
-  success "Loaded $total entries from previous snapshot"
-
-  echo "$all_entries"
-}
-
-# Create chunks as a linked list (chain-style)
-# Returns the CID of the HEAD chunk (most recent)
-create_chunks() {
-  local entries="$1"
-  local total=$(echo "$entries" | jq 'length')
-  local prev_chunk_cid=""
-  local chunk_count=0
-
-  log "Creating chunk linked list (size=$CHUNK_SIZE) from $total entries..."
-
-  # Build chunks from OLDEST to NEWEST (so we can link backwards)
-  local offset=$((total - total % CHUNK_SIZE))
-  if [[ $offset -eq $total && $total -gt 0 ]]; then
-    offset=$((offset - CHUNK_SIZE))
-  fi
-
-  # Process chunks in reverse order (oldest first)
-  local chunk_cids=()
-  local temp_offset=0
-  while [[ $temp_offset -lt $total ]]; do
-    local chunk_entries=$(echo "$entries" | jq --argjson offset "$temp_offset" --argjson size "$CHUNK_SIZE" \
-      '.[$offset:($offset + $size)]')
-
-    local chunk_idx=$((temp_offset / CHUNK_SIZE))
-
-    # Create chunk object with prev link
-    local prev_link="null"
-    if [[ -n "$prev_chunk_cid" ]]; then
-      prev_link=$(jq -n --arg cid "$prev_chunk_cid" '{"/": $cid}')
-    fi
-
-    local chunk_obj=$(jq -n \
-      --arg schema "arke/snapshot-chunk@v2" \
-      --argjson chunk_index "$chunk_idx" \
-      --argjson entries "$chunk_entries" \
-      --argjson prev "$prev_link" \
-      '{schema: $schema, chunk_index: $chunk_index, entries: $entries, prev: $prev}')
-
-    # Store chunk as DAG-JSON
-    # Use HTTP API instead of docker exec (for container compatibility)
-    local chunk_cid=$(echo "$chunk_obj" | curl -sf -X POST \
-      -F "file=@-" \
-      "$IPFS_API/dag/put?store-codec=dag-json&input-codec=json&pin=true" | \
-      jq -r '.Cid["/"]' 2>&1 | tr -d '[:space:]')
-
-    log "  Chunk $chunk_idx: $chunk_cid ($(echo "$chunk_entries" | jq 'length') entries)"
-
-    prev_chunk_cid="$chunk_cid"
-    chunk_count=$((chunk_count + 1))
-    temp_offset=$((temp_offset + CHUNK_SIZE))
-  done
-
-  success "Created $chunk_count chunks in linked list"
-
-  # Return the HEAD (last chunk created, which is the newest)
-  echo "$prev_chunk_cid"
-}
+# No chunking - entries stored directly in snapshot
 
 # Main snapshot build logic
 build_snapshot() {
@@ -218,20 +137,13 @@ build_snapshot() {
   log "Chain head: ${chain_head:-none}"
   log "New sequence: $new_seq"
 
-  # Collect all entries
-  local chain_entries="[]"
+  # Walk entire chain (reads current tips from MFS for each PI)
+  # No merging with old snapshots - full walk ensures all tips are current
+  local all_entries="[]"
   if [[ -n "$chain_head" && "$chain_head" != "null" ]]; then
-    chain_entries=$(walk_chain "$chain_head")
+    all_entries=$(walk_chain "$chain_head")
   fi
 
-  local snapshot_entries="[]"
-  if [[ -n "$prev_snapshot" && "$prev_snapshot" != "null" ]]; then
-    snapshot_entries=$(get_snapshot_entries "$prev_snapshot")
-  fi
-
-  # Merge: chain entries (newest) + snapshot entries (oldest)
-  log "Merging entries..."
-  local all_entries=$(echo "$chain_entries" "$snapshot_entries" | jq -s '.[0] + .[1]')
   local total_count=$(echo "$all_entries" | jq 'length')
 
   success "Total entries to snapshot: $total_count"
@@ -240,36 +152,26 @@ build_snapshot() {
     error "No entries to snapshot"
   fi
 
-  # Create chunk linked list (returns head CID)
-  local chunks_head_cid=$(create_chunks "$all_entries")
-
-  # Create snapshot object with entries_head
+  # Create snapshot object with entries array (no chunking)
   local prev_link="null"
   if [[ -n "$prev_snapshot" && "$prev_snapshot" != "null" ]]; then
     prev_link=$(jq -n --arg cid "$prev_snapshot" '{"/": $cid}')
   fi
 
-  local entries_head_link="null"
-  if [[ -n "$chunks_head_cid" && "$chunks_head_cid" != "null" ]]; then
-    entries_head_link=$(jq -n --arg cid "$chunks_head_cid" '{"/": $cid}')
-  fi
-
   local snapshot=$(jq -n \
-    --arg schema "arke/snapshot@v3" \
+    --arg schema "arke/snapshot@v0" \
     --argjson seq "$new_seq" \
     --arg ts "$timestamp" \
     --argjson prev "$prev_link" \
     --argjson total "$total_count" \
-    --argjson chunk_size "$CHUNK_SIZE" \
-    --argjson entries_head "$entries_head_link" \
+    --argjson entries "$all_entries" \
     '{
       schema: $schema,
       seq: $seq,
       ts: $ts,
       prev_snapshot: $prev,
       total_count: $total,
-      chunk_size: $chunk_size,
-      entries_head: $entries_head
+      entries: $entries
     }')
 
   log "Storing snapshot metadata..."

@@ -115,8 +115,8 @@ get_snapshot() {
   fi
 
   local schema=$(echo "$snapshot" | jq -r '.schema // ""')
-  if [[ "$schema" != "arke/snapshot@v3" ]]; then
-    error "Invalid snapshot schema: $schema (expected arke/snapshot@v3)"
+  if [[ "$schema" != "arke/snapshot@v0" ]]; then
+    error "Invalid snapshot schema: $schema (expected arke/snapshot@v0)"
   fi
 
   log "Snapshot schema: $schema"
@@ -131,43 +131,10 @@ shard_path() {
   echo "$INDEX_ROOT/$shard1/$shard2"
 }
 
-# Get all entries from snapshot (v3 only - linked list of chunks)
+# Get all entries from snapshot (direct array, no chunking)
 get_snapshot_entries() {
   local snapshot="$1"
-
-  log "Fetching linked list snapshot entries..."
-  local entries_head=$(echo "$snapshot" | jq -r '.entries_head["/"] // empty')
-
-  if [[ -z "$entries_head" || "$entries_head" == "null" ]]; then
-    error "Snapshot missing entries_head"
-  fi
-
-  local all_entries="[]"
-  local current="$entries_head"
-  local chunk_index=0
-
-  # Walk linked list from HEAD (newest) to tail (oldest)
-  while [[ -n "$current" && "$current" != "null" ]]; do
-    log "  Fetching chunk $chunk_index: $current"
-
-    local chunk=$(curl -sf -X POST "$IPFS_API/dag/get?arg=$current" 2>/dev/null)
-    if [[ -z "$chunk" ]]; then
-      warn "Failed to fetch chunk $current, stopping"
-      break
-    fi
-
-    local chunk_entries=$(echo "$chunk" | jq '.entries')
-    # Prepend entries (since we're walking newest to oldest)
-    all_entries=$(echo "$chunk_entries" "$all_entries" | jq -s '.[0] + .[1]')
-
-    # Move to previous (older) chunk
-    current=$(echo "$chunk" | jq -r '.prev["/"] // empty')
-    chunk_index=$((chunk_index + 1))
-  done
-
-  local total=$(echo "$all_entries" | jq 'length')
-  success "Loaded $total entries from $chunk_index chunks"
-  echo "$all_entries"
+  echo "$snapshot" | jq '.entries'
 }
 
 # Create .tip file in MFS
@@ -219,7 +186,7 @@ rebuild_mfs() {
   # Loop using array indices (avoids streaming issues)
   for i in $(seq 0 $((count - 1))); do
     local pi=$(echo "$entries" | jq -r ".[$i].pi")
-    local tip_cid=$(echo "$entries" | jq -r ".[$i].tip[\"/\"]")
+    local tip_cid=$(echo "$entries" | jq -r ".[$i].tip_cid[\"/\"] // .[$i].tip_cid")
     local ver=$(echo "$entries" | jq -r ".[$i].ver")
 
     # Validate we got real values

@@ -8,20 +8,18 @@ import subprocess
 import os
 from pathlib import Path
 
-async def append_to_chain(pi: str, tip_cid: str, ver: int) -> str:
+async def append_to_chain(pi: str) -> str:
     """
-    Append a new entry to the recent chain.
+    Append a new PI to the recent chain.
+    Chain is just an ordered list of PIs - tip/version info is in MFS.
     Returns the new chain entry CID.
     """
     # 1. Get current index pointer
     pointer = await index_pointer.get_index_pointer()
 
-    # 2. Create new chain entry
-    # Link to recent_chain_head (which is never reset, so chain stays continuous)
+    # 2. Create new chain entry (just PI + timestamp + prev link)
     entry = ChainEntry(
         pi=pi,
-        ver=ver,
-        tip={"/": tip_cid},
         ts=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         prev={"/": pointer.recent_chain_head} if pointer.recent_chain_head else None
     )
@@ -84,6 +82,7 @@ async def append_to_chain(pi: str, tip_cid: str, ver: int) -> str:
 async def query_chain(limit: int = 10, cursor: str | None = None) -> tuple[list[dict], str | None]:
     """
     Walk the recent chain and return up to `limit` items.
+    For each PI, reads the current tip from MFS to get latest version info.
     Returns (items, next_cursor).
     """
     pointer = await index_pointer.get_index_pointer()
@@ -98,7 +97,7 @@ async def query_chain(limit: int = 10, cursor: str | None = None) -> tuple[list[
 
     async with httpx.AsyncClient() as client:
         for _ in range(limit):
-            # Fetch chain entry
+            # Fetch chain entry (just PI + timestamp)
             response = await client.post(
                 f"{settings.IPFS_API_URL}/dag/get",
                 params={"arg": current_cid},
@@ -107,12 +106,32 @@ async def query_chain(limit: int = 10, cursor: str | None = None) -> tuple[list[
             response.raise_for_status()
             entry_data = response.json()
 
-            # Add to results (without the prev link for API response)
+            pi = entry_data["pi"]
+
+            # Read current tip from MFS to get latest manifest CID
+            tip_response = await client.post(
+                f"{settings.IPFS_API_URL}/files/read",
+                params={"arg": f"/arke/index/{pi[:2]}/{pi[2:4]}/{pi}.tip"},
+                timeout=5.0
+            )
+            tip_response.raise_for_status()
+            tip_cid = tip_response.text.strip()
+
+            # Fetch manifest to get version number
+            manifest_response = await client.post(
+                f"{settings.IPFS_API_URL}/dag/get",
+                params={"arg": tip_cid},
+                timeout=5.0
+            )
+            manifest_response.raise_for_status()
+            manifest = manifest_response.json()
+
+            # Add to results with current tip info (read from MFS, always fresh)
             items.append({
-                "pi": entry_data["pi"],
-                "ver": entry_data["ver"],
-                "tip": entry_data["tip"]["/"],
-                "ts": entry_data["ts"]
+                "pi": pi,
+                "ver": manifest["ver"],
+                "tip": tip_cid,
+                "ts": entry_data["ts"]  # Timestamp from chain entry (when PI was created)
             })
 
             # Move to previous

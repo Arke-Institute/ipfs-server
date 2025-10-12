@@ -68,11 +68,12 @@ async def get_pointer():
 @app.post("/chain/append")
 async def append_chain(request: AppendChainRequest):
     """
-    Append new entry to recent chain.
+    Append new PI to recent chain.
     Called by API wrapper after entity creation.
+    Chain only stores PI + timestamp - tip/version info is in MFS.
     """
     try:
-        cid = await chain.append_to_chain(request.pi, request.tip_cid, request.ver)
+        cid = await chain.append_to_chain(request.pi)
         return {"cid": cid, "success": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

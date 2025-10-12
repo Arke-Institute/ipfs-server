@@ -15,27 +15,18 @@ class IndexPointer(BaseModel):
     last_updated: str
 
 class ChainEntry(BaseModel):
-    schema: str = "arke/chain-entry@v1"
+    schema: str = "arke/chain-entry@v0"
     pi: str
-    ver: int
-    tip: dict  # IPLD link: {"/": "cid"}
     ts: str
-    prev: Optional[dict] = None  # IPLD link or null
-
-class SnapshotChunk(BaseModel):
-    schema: str = "arke/snapshot-chunk@v2"
-    chunk_index: int
-    entries: list[dict]
-    prev: Optional[dict] = None  # IPLD link to previous chunk (linked list)
+    prev: Optional[dict] = None  # IPLD link: {"/": "cid"} or null
 
 class Snapshot(BaseModel):
-    schema: str = "arke/snapshot@v3"
+    schema: str = "arke/snapshot@v0"
     seq: int
     ts: str
     prev_snapshot: Optional[dict] = None  # Link to previous snapshot
     total_count: int
-    chunk_size: int
-    entries_head: Optional[dict] = None  # IPLD link to head of chunk linked list
+    entries: list[dict]  # Direct array, no chunking
 
 class EntitiesResponse(BaseModel):
     items: list[dict]
@@ -45,5 +36,3 @@ class EntitiesResponse(BaseModel):
 
 class AppendChainRequest(BaseModel):
     pi: str
-    tip_cid: str
-    ver: int
