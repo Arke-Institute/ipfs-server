@@ -12,8 +12,9 @@ A practical guide for implementing the Arke API Service endpoints using Kubo's H
 6. [Listing Versions (GET /entities/{pi}/versions)](#5-listing-versions-get-entitiespi-versions)
 7. [Fetching Specific Versions](#6-fetching-specific-versions)
 8. [Resolving PI to Tip (GET /resolve/{pi})](#7-resolving-pi-to-tip-get-resolvepi)
-9. [Complete Example Flow](#complete-example-flow)
-10. [Error Handling](#error-handling)
+9. [Bulk Snapshot Access (GET /snapshot/latest)](#8-bulk-snapshot-access-get-snapshotlatest)
+10. [Complete Example Flow](#complete-example-flow)
+11. [Error Handling](#error-handling)
 
 ---
 
@@ -576,6 +577,96 @@ bafyreinew789...
   "tip": "bafyreinew789..."
 }
 ```
+
+---
+
+## 8. Bulk Snapshot Access (GET /snapshot/latest)
+
+**API Service Endpoint:** `GET /snapshot/latest`
+**Purpose:** Retrieve complete snapshot of all entities for bulk mirroring or backup.
+
+### Direct Snapshot Fetch
+
+The snapshot is stored as a dag-json object and can be fetched directly via the API endpoint. The endpoint streams the response to handle large snapshots efficiently.
+
+**API Service Call:**
+```bash
+curl http://localhost:3000/snapshot/latest
+```
+
+**Response Headers:**
+```
+HTTP/1.1 200 OK
+X-Snapshot-CID: baguqeerauu7ix6wir2c67w6bvnuboe6zbvz6n3itmubjbfaov5xngj7q2tba
+X-Snapshot-Seq: 1
+X-Snapshot-Count: 2307
+Content-Type: application/json
+Transfer-Encoding: chunked
+```
+
+**Response Body:**
+```json
+{
+  "schema": "arke/snapshot@v0",
+  "seq": 1,
+  "ts": "2025-10-14T17:45:31Z",
+  "total_count": 2307,
+  "prev_snapshot": {"/": "baguqeera..."},
+  "entries": [
+    {
+      "pi": "01K7CQ3NAQTZ15RAHG2VHRJK9S",
+      "ver": 2,
+      "tip_cid": {"/": "baguqeera..."},
+      "ts": "2025-10-12T17:22:20.166690Z",
+      "chain_cid": {"/": "baguqeera..."}
+    },
+    ...
+  ]
+}
+```
+
+### Snapshot Entry Structure
+
+Each entry in the snapshot contains:
+- **pi**: The persistent identifier (ULID)
+- **ver**: Version number (from manifest at snapshot time)
+- **tip_cid**: IPLD link to manifest CID (at snapshot time)
+- **ts**: Timestamp when PI was created
+- **chain_cid**: IPLD link to chain entry CID
+
+### Important Notes
+
+**Streaming Response:**
+The endpoint uses HTTP streaming to handle large snapshots without memory issues. The response is sent in chunks as it's read from IPFS.
+
+**Performance:**
+- ~1.2 seconds for 2,300 entries (596 KB)
+- ~1,900 entries/second throughput
+- Configurable timeout via `SNAPSHOT_TIMEOUT_SECONDS` (default: 60s)
+
+**Data Freshness:**
+The snapshot represents a **point-in-time view** of the system:
+- **PI list is guaranteed** - All PIs in the snapshot are valid
+- **Tip CIDs are not guaranteed current** - Versions may have been added since snapshot
+- For current tip, always read from MFS `.tip` file or use `/resolve/{pi}` endpoint
+
+**404 Response:**
+If no snapshot has been built yet:
+```bash
+curl http://localhost:3000/snapshot/latest
+# → {"detail":"No snapshot available yet. Create entities and trigger a snapshot first."}
+```
+
+### Use Cases
+
+**Bulk Mirroring:**
+Download snapshot to get complete list of all PIs with version info. See [MIRRORING.md](MIRRORING.md) for complete mirroring strategy.
+
+**Disaster Recovery:**
+Snapshots serve as the foundation for CAR-based backup and restore. See [DISASTER_RECOVERY.md](DISASTER_RECOVERY.md) for DR procedures.
+
+**Analytics:**
+Process complete entity list for reporting, statistics, or bulk operations.
 
 ---
 

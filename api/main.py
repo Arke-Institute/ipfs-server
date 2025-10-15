@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from config import settings
 import index_pointer
 import chain
 from models import EntitiesResponse, AppendChainRequest
+import httpx
 
 app = FastAPI(title="Arke IPFS Index API", version="1.0.0")
 
@@ -67,6 +69,60 @@ async def get_pointer():
     """Get current index pointer."""
     try:
         return await index_pointer.get_index_pointer()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/snapshot/latest")
+async def get_latest_snapshot():
+    """
+    Get the latest snapshot as streaming JSON.
+
+    Returns the complete snapshot object which includes:
+    - schema, seq, ts: Snapshot metadata
+    - total_count: Total number of entities
+    - entries[]: Array of {pi, ver, tip_cid, ts, chain_cid} objects
+    - prev_snapshot: Link to previous snapshot
+
+    This endpoint is designed for bulk mirror access - clients can download
+    the entire snapshot to get all historical PIs without walking the chain.
+    Uses streaming to handle large snapshots efficiently.
+    """
+    try:
+        # Get index pointer to find latest snapshot
+        pointer = await index_pointer.get_index_pointer()
+
+        if not pointer.latest_snapshot_cid:
+            raise HTTPException(
+                status_code=404,
+                detail="No snapshot available yet. Create entities and trigger a snapshot first."
+            )
+
+        # Stream the snapshot from Kubo
+        async def stream_snapshot():
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST",
+                    f"{settings.IPFS_API_URL}/dag/get",
+                    params={"arg": pointer.latest_snapshot_cid},
+                    timeout=settings.SNAPSHOT_TIMEOUT_SECONDS
+                ) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+
+        return StreamingResponse(
+            stream_snapshot(),
+            media_type="application/json",
+            headers={
+                "X-Snapshot-CID": pointer.latest_snapshot_cid,
+                "X-Snapshot-Seq": str(pointer.snapshot_seq),
+                "X-Snapshot-Count": str(pointer.snapshot_count)
+            }
+        )
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=503, detail=f"Failed to retrieve snapshot from IPFS: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

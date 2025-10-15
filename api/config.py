@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     INDEX_POINTER_PATH: str
     SNAPSHOT_INTERVAL_MINUTES: int = 60  # Default: 1 hour
     AUTO_SNAPSHOT: bool = True
+    SNAPSHOT_TIMEOUT_SECONDS: int = 60  # Timeout for snapshot retrieval (large files)
 
     model_config = ConfigDict(
         env_file=".env",
