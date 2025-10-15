@@ -51,31 +51,46 @@ get_index_pointer() {
   fi
 }
 
-# Walk entire chain and collect all PIs, reading current tips from MFS
-walk_chain() {
-  local chain_head="$1"
+# Walk event chain and collect unique PIs, reading current tips from MFS
+walk_event_chain() {
+  local event_head="$1"
   local entries="[]"
-  local current="$chain_head"
+  local current="$event_head"
   local count=0
+  declare -A seen_pis  # Track unique PIs
 
-  log "Walking entire PI chain from head (reading current tips from MFS)..."
+  log "Walking event chain from head (collecting unique PIs)..."
 
   while [[ -n "$current" && "$current" != "null" ]]; do
-    count=$((count + 1))
+    # Fetch event entry
+    local event=$(curl -sf -X POST "$IPFS_API/dag/get?arg=$current" 2>/dev/null)
 
-    # Fetch chain entry (just PI + timestamp + prev)
-    local entry=$(curl -sf -X POST "$IPFS_API/dag/get?arg=$current" 2>/dev/null)
-
-    if [[ -z "$entry" ]]; then
-      warn "Failed to fetch chain entry $current, stopping"
+    if [[ -z "$event" ]]; then
+      warn "Failed to fetch event $current, stopping"
       break
     fi
 
-    # Extract PI and timestamp from chain entry
-    local pi=$(echo "$entry" | jq -r '.pi')
-    local ts=$(echo "$entry" | jq -r '.ts')
+    # Extract PI and timestamp from event
+    local pi=$(echo "$event" | jq -r '.pi')
+    local ts=$(echo "$event" | jq -r '.ts')
+    local event_type=$(echo "$event" | jq -r '.type')
 
-    # Read CURRENT tip from MFS (not from chain entry)
+    # Skip if we've already seen this PI
+    if [[ -n "${seen_pis[$pi]:-}" ]]; then
+      # Move to previous event
+      local prev=$(echo "$event" | jq -r '.prev["/"] // empty')
+      if [[ -z "$prev" ]]; then
+        break
+      fi
+      current="$prev"
+      continue
+    fi
+
+    # Mark as seen
+    seen_pis[$pi]=1
+    count=$((count + 1))
+
+    # Read CURRENT tip from MFS (always up-to-date)
     local shard1="${pi:0:2}"
     local shard2="${pi:2:2}"
     local tip_path="/arke/index/$shard1/$shard2/${pi}.tip"
@@ -84,7 +99,7 @@ walk_chain() {
 
     if [[ -z "$tip_cid" ]]; then
       warn "Failed to read tip for $pi, skipping"
-      current=$(echo "$entry" | jq -r '.prev["/"] // empty')
+      current=$(echo "$event" | jq -r '.prev["/"] // empty')
       continue
     fi
 
@@ -97,7 +112,7 @@ walk_chain() {
     # Build snapshot entry
     # IMPORTANT:
     # - tip_cid as IPLD LINK so CAR exporter includes manifests + version history
-    # - chain_cid as IPLD LINK so CAR exporter includes chain entries
+    # - chain_cid as IPLD LINK so CAR exporter includes event entries
     # - Both needed for complete DR restore
     local new_entry=$(jq -n \
       --arg pi "$pi" \
@@ -109,15 +124,15 @@ walk_chain() {
 
     entries=$(echo "$entries" | jq --argjson entry "$new_entry" '. = [$entry] + .')
 
-    # Move to previous
-    local prev=$(echo "$entry" | jq -r '.prev["/"] // empty')
+    # Move to previous event
+    local prev=$(echo "$event" | jq -r '.prev["/"] // empty')
     if [[ -z "$prev" ]]; then
       break
     fi
     current="$prev"
   done
 
-  success "Collected $count entries from chain (tips read from MFS)"
+  success "Collected $count unique PIs from event chain (tips read from MFS)"
   echo "$entries"
 }
 
@@ -133,19 +148,19 @@ build_snapshot() {
 
   local prev_snapshot=$(echo "$pointer" | jq -r '.latest_snapshot_cid // empty')
   local prev_seq=$(echo "$pointer" | jq -r '.snapshot_seq // 0')
-  local chain_head=$(echo "$pointer" | jq -r '.recent_chain_head // empty')
+  local event_head=$(echo "$pointer" | jq -r '.event_head // empty')
 
   local new_seq=$((prev_seq + 1))
 
   log "Previous snapshot: ${prev_snapshot:-none}"
-  log "Chain head: ${chain_head:-none}"
+  log "Event head: ${event_head:-none}"
   log "New sequence: $new_seq"
 
-  # Walk entire chain (reads current tips from MFS for each PI)
+  # Walk entire event chain (reads current tips from MFS for each unique PI)
   # No merging with old snapshots - full walk ensures all tips are current
   local all_entries="[]"
-  if [[ -n "$chain_head" && "$chain_head" != "null" ]]; then
-    all_entries=$(walk_chain "$chain_head")
+  if [[ -n "$event_head" && "$event_head" != "null" ]]; then
+    all_entries=$(walk_event_chain "$event_head")
   fi
 
   local total_count=$(echo "$all_entries" | jq 'length')
@@ -163,17 +178,20 @@ build_snapshot() {
     prev_link=$(jq -n --arg cid "$prev_snapshot" '{"/": $cid}')
   fi
 
+  # Include event_cid checkpoint (for mirrors to start from)
   local snapshot=$(echo "$all_entries" | jq \
-    --arg schema "arke/snapshot@v0" \
+    --arg schema "arke/snapshot@v1" \
     --argjson seq "$new_seq" \
     --arg ts "$timestamp" \
     --argjson prev "$prev_link" \
+    --arg event_cid "$event_head" \
     --argjson total "$total_count" \
     '{
       schema: $schema,
       seq: $seq,
       ts: $ts,
       prev_snapshot: $prev,
+      event_cid: $event_cid,
       total_count: $total,
       entries: .
     }')
@@ -188,33 +206,39 @@ build_snapshot() {
   success "Snapshot created: $snapshot_cid"
 
   # Update index pointer
-  # IMPORTANT: Keep recent_chain_head pointing to the latest entity!
-  # This maintains chain continuity - new entities link to it via prev.
-  # Only recent_count resets to 0 (meaning: no new entities since snapshot).
-  log "Updating index pointer (preserving chain head)..."
+  # IMPORTANT: Keep event_head pointing to the latest event!
+  # This maintains chain continuity - new events link to it via prev.
+  # Store snapshot_event_cid as checkpoint for mirrors.
+  log "Updating index pointer (preserving event head)..."
 
-  # Build chain_head value (null if empty, otherwise the CID)
-  local chain_head_value="null"
-  if [[ -n "$chain_head" && "$chain_head" != "null" ]]; then
-    chain_head_value="\"$chain_head\""
+  # Build event_head value (null if empty, otherwise the CID)
+  local event_head_value="null"
+  if [[ -n "$event_head" && "$event_head" != "null" ]]; then
+    event_head_value="\"$event_head\""
   fi
 
+  # Get current event_count from pointer (preserve it)
+  local event_count=$(echo "$pointer" | jq -r '.event_count // 0')
+
   local new_pointer=$(jq -n \
-    --arg schema "arke/index-pointer@v1" \
+    --arg schema "arke/index-pointer@v2" \
     --arg snapshot_cid "$snapshot_cid" \
+    --arg snapshot_event_cid "$event_head" \
     --argjson seq "$new_seq" \
     --argjson count "$total_count" \
     --arg ts "$timestamp" \
     --arg updated "$timestamp" \
-    --argjson chain_head "$chain_head_value" \
+    --argjson event_head "$event_head_value" \
+    --argjson event_count "$event_count" \
     '{
       schema: $schema,
+      event_head: $event_head,
+      event_count: $event_count,
       latest_snapshot_cid: $snapshot_cid,
+      snapshot_event_cid: $snapshot_event_cid,
       snapshot_seq: $seq,
       snapshot_count: $count,
       snapshot_ts: $ts,
-      recent_chain_head: $chain_head,
-      recent_count: 0,
       total_count: $count,
       last_updated: $updated
     }')

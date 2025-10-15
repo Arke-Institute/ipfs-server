@@ -1,129 +1,132 @@
 import httpx
 from datetime import datetime, timezone
 from config import settings
-from models import ChainEntry, IndexPointer
+from models import Event, IndexPointer
 import index_pointer
 import json
+import asyncio
 import subprocess
 import os
 from pathlib import Path
-import asyncio
 
-# Global lock to prevent race conditions during chain append operations
-_chain_append_lock = asyncio.Lock()
+# Global lock to prevent race conditions during event append operations
+_event_append_lock = asyncio.Lock()
 
-async def append_to_chain(pi: str) -> str:
+async def append_event(event_type: str, pi: str, ver: int, tip_cid: str) -> str:
     """
-    Append a new PI to the recent chain.
-    Chain is just an ordered list of PIs - tip/version info is in MFS.
-    Returns the new chain entry CID.
+    Append new event to the event chain.
+
+    Args:
+        event_type: "create" or "update"
+        pi: Persistent identifier (ULID)
+        ver: Version number (from manifest)
+        tip_cid: Manifest CID
+
+    Returns:
+        Event CID
 
     Uses a lock to prevent race conditions when multiple concurrent requests
-    try to append to the chain simultaneously.
+    try to append to the event chain simultaneously.
     """
-    async with _chain_append_lock:
+    async with _event_append_lock:
         # 1. Get current index pointer
         pointer = await index_pointer.get_index_pointer()
 
-        # 2. Create new chain entry (just PI + timestamp + prev link)
-        entry = ChainEntry(
+        # 2. Create new event
+        event = Event(
+            type=event_type,
             pi=pi,
+            ver=ver,
+            tip_cid={"/": tip_cid},
             ts=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-            prev={"/": pointer.recent_chain_head} if pointer.recent_chain_head else None
+            prev={"/": pointer.event_head} if pointer.event_head else None
         )
 
-        # 3. Store as DAG-JSON
+        # 3. Store as DAG-CBOR (more efficient and works with HTTP API dag/get)
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{settings.IPFS_API_URL}/dag/put",
                 params={
-                    "store-codec": "dag-json",
+                    "store-codec": "dag-cbor",
                     "input-codec": "json",
                     "pin": "true"
                 },
-                files={"file": ("entry.json", entry.model_dump_json().encode(), "application/json")},
+                files={"file": ("event.json", event.model_dump_json().encode(), "application/json")},
                 timeout=10.0
             )
             response.raise_for_status()
 
             # Parse the response to get the CID
             result_text = response.text.strip()
-            # The response is a JSON object with Cid field
             result = json.loads(result_text)
             new_cid = result["Cid"]["/"]
 
         # 4. Update index pointer
-        pointer.recent_chain_head = new_cid
-        pointer.recent_count += 1
-        pointer.total_count += 1
+        pointer.event_head = new_cid
+        pointer.event_count += 1
+
+        # Update total_count only for create events
+        if event_type == "create":
+            pointer.total_count += 1
+
         await index_pointer.update_index_pointer(pointer)
 
         return new_cid
 
-async def query_chain(limit: int = 10, cursor: str | None = None) -> tuple[list[dict], str | None]:
+async def query_events(limit: int = 50, cursor: str | None = None) -> tuple[list[dict], str | None]:
     """
-    Walk the recent chain and return up to `limit` items.
-    For each PI, reads the current tip from MFS to get latest version info.
-    Returns (items, next_cursor).
+    Walk the event chain and return up to `limit` events.
+
+    Args:
+        limit: Maximum number of events to return
+        cursor: Event CID to start from (or None for head)
+
+    Returns:
+        (events_list, next_cursor)
+
+    Events are returned in reverse chronological order (newest first).
+    Each event includes: event_cid, type, pi, ver, tip_cid, ts
     """
     pointer = await index_pointer.get_index_pointer()
 
     # Start from cursor or head
-    current_cid = cursor or pointer.recent_chain_head
+    current_cid = cursor or pointer.event_head
 
     if not current_cid:
         return [], None
 
-    items = []
+    events = []
 
     async with httpx.AsyncClient() as client:
         for _ in range(limit):
-            # Fetch chain entry (just PI + timestamp)
+            # Fetch event
             response = await client.post(
                 f"{settings.IPFS_API_URL}/dag/get",
                 params={"arg": current_cid},
                 timeout=5.0
             )
             response.raise_for_status()
-            entry_data = response.json()
+            event_data = response.json()
 
-            pi = entry_data["pi"]
-
-            # Read current tip from MFS to get latest manifest CID
-            tip_response = await client.post(
-                f"{settings.IPFS_API_URL}/files/read",
-                params={"arg": f"/arke/index/{pi[:2]}/{pi[2:4]}/{pi}.tip"},
-                timeout=5.0
-            )
-            tip_response.raise_for_status()
-            tip_cid = tip_response.text.strip()
-
-            # Fetch manifest to get version number
-            manifest_response = await client.post(
-                f"{settings.IPFS_API_URL}/dag/get",
-                params={"arg": tip_cid},
-                timeout=5.0
-            )
-            manifest_response.raise_for_status()
-            manifest = manifest_response.json()
-
-            # Add to results with current tip info (read from MFS, always fresh)
-            items.append({
-                "pi": pi,
-                "ver": manifest["ver"],
-                "tip": tip_cid,
-                "ts": entry_data["ts"]  # Timestamp from chain entry (when PI was created)
+            # Add to results
+            events.append({
+                "event_cid": current_cid,
+                "type": event_data["type"],
+                "pi": event_data["pi"],
+                "ver": event_data["ver"],
+                "tip_cid": event_data["tip_cid"]["/"],
+                "ts": event_data["ts"]
             })
 
             # Move to previous
-            if not entry_data.get("prev"):
+            if not event_data.get("prev"):
                 # End of chain
-                return items, None
+                return events, None
 
-            current_cid = entry_data["prev"]["/"]
+            current_cid = event_data["prev"]["/"]
 
-        # More items available
-        return items, current_cid
+        # More events available
+        return events, current_cid
 
 async def trigger_scheduled_snapshot():
     """
@@ -144,7 +147,7 @@ async def trigger_scheduled_snapshot():
         print("ℹ️  No entities to snapshot, skipping scheduled trigger")
         return
 
-    print(f"⏰ Scheduled snapshot trigger (total: {pointer.total_count}, recent: {pointer.recent_count})")
+    print(f"⏰ Scheduled snapshot trigger (total PIs: {pointer.total_count}, total events: {pointer.event_count})")
 
     # Path to build-snapshot.sh script (inside container: /app/scripts/)
     script_path = "/app/scripts/build-snapshot.sh"
@@ -163,8 +166,8 @@ async def trigger_scheduled_snapshot():
         with open(log_path, 'a') as log_file:
             log_file.write(f"\n{'='*60}\n")
             log_file.write(f"[SCHEDULED] Snapshot build triggered at {trigger_time}\n")
-            log_file.write(f"Total entities: {pointer.total_count}\n")
-            log_file.write(f"Recent count: {pointer.recent_count}\n")
+            log_file.write(f"Total PIs: {pointer.total_count}\n")
+            log_file.write(f"Total events: {pointer.event_count}\n")
             log_file.write(f"{'='*60}\n\n")
 
             subprocess.Popen(

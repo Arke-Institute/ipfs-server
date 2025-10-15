@@ -19,14 +19,15 @@ async def get_index_pointer() -> IndexPointer:
             return IndexPointer(**data)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 500:  # File doesn't exist
-            # Initialize empty index pointer
+            # Initialize empty index pointer (v2 schema)
             return IndexPointer(
+                event_head=None,
+                event_count=0,
                 latest_snapshot_cid=None,
+                snapshot_event_cid=None,
                 snapshot_seq=0,
                 snapshot_count=0,
                 snapshot_ts=None,
-                recent_chain_head=None,
-                recent_count=0,
                 total_count=0,
                 last_snapshot_trigger=None,
                 last_updated=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')

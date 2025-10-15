@@ -13,8 +13,10 @@ A practical guide for implementing the Arke API Service endpoints using Kubo's H
 7. [Fetching Specific Versions](#6-fetching-specific-versions)
 8. [Resolving PI to Tip (GET /resolve/{pi})](#7-resolving-pi-to-tip-get-resolvepi)
 9. [Bulk Snapshot Access (GET /snapshot/latest)](#8-bulk-snapshot-access-get-snapshotlatest)
-10. [Complete Example Flow](#complete-example-flow)
-11. [Error Handling](#error-handling)
+10. [Event Stream (GET /events)](#9-event-stream-get-events)
+11. [Appending Events (POST /events/append)](#10-appending-events-post-eventsappend)
+12. [Complete Example Flow](#complete-example-flow)
+13. [Error Handling](#error-handling)
 
 ---
 
@@ -607,9 +609,10 @@ Transfer-Encoding: chunked
 **Response Body:**
 ```json
 {
-  "schema": "arke/snapshot@v0",
+  "schema": "arke/snapshot@v1",
   "seq": 1,
   "ts": "2025-10-14T17:45:31Z",
+  "event_cid": "baguqeera...",
   "total_count": 2307,
   "prev_snapshot": {"/": "baguqeera..."},
   "entries": [
@@ -667,6 +670,211 @@ Snapshots serve as the foundation for CAR-based backup and restore. See [DISASTE
 
 **Analytics:**
 Process complete entity list for reporting, statistics, or bulk operations.
+
+---
+
+## 9. Event Stream (GET /events)
+
+**API Service Endpoint:** `GET /events?limit=50&cursor=baguqeera...`
+**Purpose:** Retrieve time-ordered event stream for mirroring and change tracking.
+
+### Event Stream Query
+
+The event stream provides a complete log of all creates and updates in chronological order.
+
+**API Service Call:**
+```bash
+curl http://localhost:3000/events?limit=50
+```
+
+**Response:**
+```json
+{
+  "items": [
+    {
+      "event_cid": "baguqeera111...",
+      "type": "update",
+      "pi": "01K75GZSKKSP2K6TP05JBFNV09",
+      "ver": 3,
+      "tip_cid": "bafyreiabc...",
+      "ts": "2025-10-14T18:30:00.123Z"
+    },
+    {
+      "event_cid": "baguqeera222...",
+      "type": "create",
+      "pi": "01K75HQRKKTP3K7UQ16KCGOW1A",
+      "ver": 1,
+      "tip_cid": "bafyreidef...",
+      "ts": "2025-10-14T18:25:00.456Z"
+    },
+    {
+      "event_cid": "baguqeera333...",
+      "type": "update",
+      "pi": "01K75GZSKKSP2K6TP05JBFNV09",
+      "ver": 2,
+      "tip_cid": "bafyreighi...",
+      "ts": "2025-10-14T18:20:00.789Z"
+    }
+  ],
+  "total_events": 5432,
+  "total_pis": 2307,
+  "has_more": true,
+  "next_cursor": "baguqeera444..."
+}
+```
+
+### Event Types
+
+**Create Event:**
+- `type`: "create"
+- Indicates a new PI was added to the system
+- `ver` will typically be 1 (but could be higher if created with multiple versions)
+
+**Update Event:**
+- `type`: "update"
+- Indicates an existing PI received a new version
+- `ver` will be greater than previous version
+
+### Pagination
+
+Use cursor-based pagination to walk the event chain:
+
+```bash
+# First page (most recent events)
+curl http://localhost:3000/events?limit=50
+
+# Subsequent pages
+curl "http://localhost:3000/events?limit=50&cursor=baguqeera444..."
+```
+
+### Use Cases
+
+**Mirroring:**
+Start from snapshot `event_cid` checkpoint and walk to head to catch all changes:
+
+```python
+# Get snapshot
+snapshot = requests.get("http://localhost:3000/snapshot/latest").json()
+checkpoint = snapshot['event_cid']
+
+# Walk from checkpoint to head
+cursor = checkpoint
+while True:
+    response = requests.get(f"http://localhost:3000/events?limit=100&cursor={cursor}")
+    data = response.json()
+
+    for event in data['items']:
+        if event['event_cid'] == checkpoint:
+            break  # Reached checkpoint
+
+        apply_event(event)  # Create or update local copy
+
+    if not data['has_more']:
+        break
+
+    cursor = data['next_cursor']
+```
+
+**Change Tracking:**
+Poll regularly for new events:
+
+```python
+last_seen_event = load_from_db()
+
+response = requests.get("http://localhost:3000/events?limit=50")
+data = response.json()
+
+for event in data['items']:
+    if event['event_cid'] == last_seen_event:
+        break  # Caught up
+
+    process_event(event)
+
+save_to_db(data['items'][0]['event_cid'])
+```
+
+---
+
+## 10. Appending Events (POST /events/append)
+
+**API Service Endpoint:** `POST /events/append`
+**Purpose:** Record create/update events to the event chain (called by API wrapper).
+
+### Request Body
+
+```json
+{
+  "type": "create",
+  "pi": "01K75GZSKKSP2K6TP05JBFNV09",
+  "ver": 1,
+  "tip_cid": "bafyreiabc123..."
+}
+```
+
+**Fields:**
+- `type`: "create" or "update"
+- `pi`: Persistent identifier (ULID)
+- `ver`: Version number from manifest
+- `tip_cid`: Manifest CID
+
+### Kubo Implementation
+
+The endpoint implementation uses DAG operations:
+
+```python
+# Create event object
+event = {
+    "schema": "arke/event@v1",
+    "type": request.type,
+    "pi": request.pi,
+    "ver": request.ver,
+    "tip_cid": {"/": request.tip_cid},
+    "ts": datetime.now(timezone.utc).isoformat(),
+    "prev": {"/": event_head} if event_head else None
+}
+
+# Store as DAG-JSON
+event_cid = dag_put(event, codec="dag-json", pin=True)
+
+# Update index pointer
+index_pointer['event_head'] = event_cid
+index_pointer['event_count'] += 1
+if request.type == "create":
+    index_pointer['total_count'] += 1
+```
+
+### Integration Points
+
+**On Entity Creation:**
+```python
+# After creating manifest and writing .tip file
+requests.post("http://localhost:3000/events/append", json={
+    "type": "create",
+    "pi": pi,
+    "ver": 1,
+    "tip_cid": manifest_cid
+})
+```
+
+**On Entity Update:**
+```python
+# After updating manifest and .tip file
+requests.post("http://localhost:3000/events/append", json={
+    "type": "update",
+    "pi": pi,
+    "ver": new_ver,
+    "tip_cid": new_manifest_cid
+})
+```
+
+### Response
+
+```json
+{
+  "event_cid": "baguqeera111...",
+  "success": true
+}
+```
 
 ---
 

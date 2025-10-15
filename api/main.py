@@ -4,8 +4,8 @@ from fastapi.responses import StreamingResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from config import settings
 import index_pointer
-import chain
-from models import EntitiesResponse, AppendChainRequest
+import events
+from models import AppendEventRequest
 import httpx
 
 app = FastAPI(title="Arke IPFS Index API", version="1.0.0")
@@ -25,42 +25,41 @@ app.add_middleware(
 async def health():
     return {"status": "healthy"}
 
-@app.get("/entities", response_model=EntitiesResponse)
-async def list_entities(
-    limit: int = 10,
+@app.get("/events")
+async def list_events(
+    limit: int = 50,
     cursor: str | None = None
 ):
     """
-    List entities with cursor-based pagination.
+    List events with cursor-based pagination.
 
-    - If no cursor provided: starts from recent_chain_head (most recent entities)
-    - If cursor provided: continues from that CID
-    - Walks the chain backwards via prev links: O(limit) always
+    Returns time-ordered log of create/update events.
+    Mirrors should poll this endpoint for incremental updates.
+
+    - If no cursor: starts from event_head (most recent)
+    - If cursor provided: continues from that event CID
+    - Walks chain backwards via prev links
+
+    Response includes:
+    - items: List of events [{event_cid, type, pi, ver, tip_cid, ts}]
+    - total_events: Total count of events
+    - total_pis: Total count of unique PIs
+    - has_more: Boolean
+    - next_cursor: Event CID for next page (or null)
     """
     try:
         pointer = await index_pointer.get_index_pointer()
 
-        # Start from cursor or head of chain
-        start_cid = cursor or pointer.recent_chain_head
+        # Walk event chain
+        items, next_cursor = await events.query_events(limit=limit, cursor=cursor)
 
-        if not start_cid:
-            # Empty chain
-            return EntitiesResponse(
-                items=[],
-                total_count=0,
-                has_more=False,
-                next_cursor=None
-            )
-
-        # Walk chain from start_cid
-        items, next_cursor = await chain.query_chain(limit=limit, cursor=start_cid)
-
-        return EntitiesResponse(
-            items=items,
-            total_count=pointer.total_count,
-            has_more=next_cursor is not None,
-            next_cursor=next_cursor
-        )
+        return {
+            "items": items,
+            "total_events": pointer.event_count,
+            "total_pis": pointer.total_count,
+            "has_more": next_cursor is not None,
+            "next_cursor": next_cursor
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -126,16 +125,26 @@ async def get_latest_snapshot():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/chain/append")
-async def append_chain(request: AppendChainRequest):
+@app.post("/events/append")
+async def append_event(request: AppendEventRequest):
     """
-    Append new PI to recent chain.
-    Called by API wrapper after entity creation.
-    Chain only stores PI + timestamp - tip/version info is in MFS.
+    Append event to chain.
+    Called by API wrapper after entity creation/update.
+
+    Request body:
+    - type: "create" | "update"
+    - pi: Persistent identifier
+    - ver: Version number
+    - tip_cid: Manifest CID
     """
     try:
-        cid = await chain.append_to_chain(request.pi)
-        return {"cid": cid, "success": True}
+        event_cid = await events.append_event(
+            event_type=request.type,
+            pi=request.pi,
+            ver=request.ver,
+            tip_cid=request.tip_cid
+        )
+        return {"event_cid": event_cid, "success": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -157,7 +166,7 @@ async def startup_event():
         print(f"🕐 Starting snapshot scheduler (every {interval} minutes)")
 
         scheduler.add_job(
-            chain.trigger_scheduled_snapshot,
+            events.trigger_scheduled_snapshot,
             'interval',
             minutes=interval,
             id='snapshot_builder',
