@@ -42,3 +42,6 @@ temp/
 # DR artifacts (generated locally, not checked in)
 snapshots/
 backups/
+
+# Deployment artifacts (instance-specific, not checked in)
+deployment-info.txt

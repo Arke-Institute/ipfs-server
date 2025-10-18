@@ -1,17 +1,19 @@
 version: '3.8'
 
+# OPTION 2: Public Access via Nginx Reverse Proxy
+# Adds rate limiting, security headers, and request logging
+# More secure than direct 0.0.0.0 binding
+
 services:
   ipfs:
     image: ipfs/kubo:latest
     container_name: ipfs-node-prod
     environment:
       - IPFS_PROFILE=server
-      # Optional: reduce resource usage
       - IPFS_FD_MAX=4096
     ports:
       - "4001:4001"              # P2P (Swarm) - public
-      - "127.0.0.1:5001:5001"    # HTTP RPC API - localhost only (security)
-      - "127.0.0.1:8080:8080"    # HTTP Gateway - localhost only (security)
+      # API and Gateway NOT exposed directly - only via nginx
     volumes:
       - ipfs_data:/data/ipfs
       - ipfs_staging:/export
@@ -35,12 +37,34 @@ services:
         reservations:
           cpus: '1'
           memory: 1G
+    networks:
+      - ipfs-network
 
-  # ipfs-api service will be added when API code is ready
-  # Uncomment and configure when deploying the API service
+  nginx:
+    image: nginx:alpine
+    container_name: ipfs-nginx
+    ports:
+      - "0.0.0.0:80:80"      # HTTP (Cloudflare handles HTTPS)
+      - "0.0.0.0:443:443"    # HTTPS (for future direct SSL)
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - ipfs
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - ipfs-network
 
 volumes:
   ipfs_data:
     driver: local
   ipfs_staging:
     driver: local
+
+networks:
+  ipfs-network:
+    driver: bridge

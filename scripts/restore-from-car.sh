@@ -115,8 +115,9 @@ get_snapshot() {
   fi
 
   local schema=$(echo "$snapshot" | jq -r '.schema // ""')
-  if [[ "$schema" != "arke/snapshot@v0" ]]; then
-    error "Invalid snapshot schema: $schema (expected arke/snapshot@v0)"
+  # Support both v0 and v1 snapshot schemas
+  if [[ "$schema" != "arke/snapshot@v0" ]] && [[ "$schema" != "arke/snapshot@v1" ]]; then
+    error "Invalid snapshot schema: $schema (expected arke/snapshot@v0 or arke/snapshot@v1)"
   fi
 
   log "Snapshot schema: $schema"

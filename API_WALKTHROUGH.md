@@ -1289,5 +1289,12 @@ echo "✓ Test complete!"
 
 ---
 
+Event Chain: 永久不变
+Snapshot: 便利快照
+
+---
+
 **Last Updated:** 2024-01-15
 **Tested With:** Kubo v0.38.1
+
+
