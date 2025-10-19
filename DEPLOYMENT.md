@@ -6,22 +6,32 @@ This guide covers deploying the Arke IPFS Server to AWS EC2 with automated scrip
 
 1. **AWS Account** with appropriate permissions
 2. **AWS CLI** installed and configured (`aws configure`)
-3. **Cloudflare Account** with a domain (optional, for DNS)
+3. **Cloudflare Account** with domain `arke.institute` configured
 4. **Local backup** (optional): Latest CAR file in `backups/` directory
+
+## Architecture Overview
+
+The deployment includes three services running in Docker containers:
+
+1. **IPFS/Kubo** (ipfs-node-prod) - Storage layer on ports 5001/8080
+2. **API Service** (ipfs-api) - FastAPI REST API on port 3000
+3. **Nginx** (ipfs-nginx) - Reverse proxy with rate limiting on ports 80/443
+
+All services communicate via Docker bridge network and are accessible publicly via Cloudflare DNS.
 
 ## Quick Start
 
-Deploy the entire infrastructure and application with two commands:
+Deploy the entire infrastructure with two commands:
 
 ```bash
 # 1. Provision AWS resources (EC2 instance, security group, SSH key)
 ./scripts/deploy-ec2.sh
 
-# 2. Set up the instance (Docker, upload files, start services)
-./scripts/setup-instance.sh <public-ip>
+# 2. Set up the instance (Docker, upload files, start all services)
+./scripts/setup-instance.sh <public-ip> [--no-restore]
 ```
 
-The scripts will output the public IP address - save this for DNS configuration.
+Add `--no-restore` flag to skip backup restoration prompt (useful for fresh deployments).
 
 ## Detailed Deployment Steps
 
@@ -35,11 +45,11 @@ Run the deployment script:
 
 This script will:
 - ✅ Create SSH key pair (`arke-ipfs-key`) and save to `~/.ssh/`
-- ✅ Create security group (`arke-ipfs-sg`) with ports: 22, 4001, 80, 443
+- ✅ Create security group (`arke-ipfs-sg`) with ports: 22, 80, 443, 4001
 - ✅ Launch t3.small EC2 instance with 30GB gp3 EBS volume
 - ✅ Wait for instance to start
 - ✅ Display instance details and next steps
-- ✅ Save deployment info to `deployment-info.txt`
+- ✅ Save deployment info to `deployment-info.txt` (gitignored)
 
 **Output example:**
 ```
@@ -55,98 +65,127 @@ Instance Details:
   SSH Key:       ~/.ssh/arke-ipfs-key.pem
 
 Next Steps:
-  1. Wait 30 seconds for instance initialization to complete
-  2. Run the setup script:
-     ./scripts/setup-instance.sh 54.123.45.67
+  1. Wait 30 seconds for instance initialization
+  2. Run: ./scripts/setup-instance.sh 54.123.45.67
 ```
 
 ### Step 2: Set Up the Instance
 
-After waiting ~30 seconds for the instance to fully initialize, run:
+After waiting ~30 seconds, run:
 
 ```bash
-./scripts/setup-instance.sh 54.123.45.67  # Use your actual public IP
+# Fresh deployment (skips backup restore)
+./scripts/setup-instance.sh 54.123.45.67 --no-restore
+
+# Or with backup restoration
+./scripts/setup-instance.sh 54.123.45.67
 ```
 
 This script will:
 - ✅ Wait for SSH to be ready
-- ✅ Install Docker and Docker Compose
-- ✅ Upload project files (docker-compose.prod.yml, scripts, docs)
+- ✅ Install Docker and essential tools (jq)
+- ✅ Upload project files (docker-compose.nginx.yml, nginx.conf, api/, scripts/, docs)
 - ✅ Upload latest CAR backup if available
 - ✅ Make scripts executable
-- ✅ Start IPFS services via Docker Compose
-- ✅ Prompt to restore from backup (if CAR file present)
+- ✅ Start all 3 services via `docker-compose.nginx.yml`
+- ✅ Optionally restore from backup (if not using `--no-restore`)
 
-**Note**: If you have a backup CAR file in `backups/`, the script will automatically upload it and offer to restore.
+**Services deployed:**
+- IPFS/Kubo node (port 5001/8080)
+- API Service (port 3000)
+- Nginx reverse proxy (ports 80/443)
 
 ### Step 3: Configure Cloudflare DNS
 
-Add an A record in Cloudflare to point your domain to the EC2 instance:
+Add two A records in Cloudflare:
 
 1. **Log in to Cloudflare Dashboard**: https://dash.cloudflare.com/
-2. **Select your domain** from the list
+2. **Select arke.institute** domain
 3. **Navigate to DNS** → DNS Records
-4. **Add a new A record**:
+4. **Add A records**:
+
+   **Record 1 - API/RPC endpoint:**
    - **Type**: A
-   - **Name**: `ipfs` (or your preferred subdomain, or `@` for root domain)
+   - **Name**: `ipfs-api`
    - **IPv4 address**: `54.123.45.67` (your EC2 public IP)
-   - **TTL**: Auto (or 300 seconds for faster updates)
-   - **Proxy status**:
-     - ☁️ **Proxied** (recommended) - Cloudflare CDN, DDoS protection, free SSL
-     - 🌐 **DNS only** - Direct connection to EC2 (if you need direct IPFS access)
-5. **Click Save**
+   - **TTL**: Auto
+   - **Proxy status**: ☁️ **Proxied** (for SSL and DDoS protection)
 
-**Result**:
-- Proxied: `https://ipfs.yourdomain.com` → Cloudflare → EC2
-- DNS only: `http://ipfs.yourdomain.com` → EC2 directly
+   **Record 2 - Gateway endpoint:**
+   - **Type**: A
+   - **Name**: `ipfs`
+   - **IPv4 address**: `54.123.45.67` (your EC2 public IP)
+   - **TTL**: Auto
+   - **Proxy status**: ☁️ **Proxied**
 
-**DNS Propagation**: Changes typically take 1-5 minutes with low TTL.
+5. **Set SSL/TLS mode** to **Flexible**:
+   - Go to **SSL/TLS** → **Overview**
+   - Select **Flexible** (Visitor → Cloudflare uses HTTPS, Cloudflare → Server uses HTTP)
+
+**Result:**
+- API/RPC: `https://ipfs-api.arke.institute` → Nginx → IPFS/API Service
+- Gateway: `https://ipfs.arke.institute` → Nginx → IPFS Gateway
+
+**DNS Propagation**: Changes typically take 1-5 minutes.
 
 ### Step 4: Verify Deployment
 
-SSH into your instance:
+Test endpoints:
+
+```bash
+# Health check
+curl https://ipfs-api.arke.institute/health
+# → {"status":"healthy"}
+
+# IPFS version
+curl -X POST https://ipfs-api.arke.institute/api/v0/version
+# → {"Version":"0.38.1",...}
+
+# Events endpoint
+curl https://ipfs-api.arke.institute/events
+# → {"items":[],...}
+
+# Index pointer
+curl https://ipfs-api.arke.institute/index-pointer
+# → {"schema":"arke/index-pointer@v2",...}
+```
+
+SSH into instance:
 
 ```bash
 ssh -i ~/.ssh/arke-ipfs-key.pem ubuntu@54.123.45.67
 ```
 
-Check services are running:
+Check services:
 
 ```bash
 cd ~/ipfs-server
-docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.nginx.yml ps
 ```
 
-You should see:
-
+Expected output:
 ```
-NAME                IMAGE               STATUS
-ipfs-server-ipfs-1  ipfs/kubo:latest   Up 2 minutes (healthy)
-```
-
-Test IPFS API:
-
-```bash
-curl -X POST http://localhost:5001/api/v0/version
-```
-
-View logs:
-
-```bash
-docker compose -f docker-compose.prod.yml logs -f
+NAME             IMAGE                  STATUS
+ipfs-api         ipfs-server-ipfs-api   Up (healthy)
+ipfs-nginx       nginx:alpine           Up
+ipfs-node-prod   ipfs/kubo:latest       Up (healthy)
 ```
 
 ## Port Configuration
 
-The production deployment (`docker-compose.prod.yml`) exposes:
+**External (via Cloudflare):**
+- `443/tcp` → Nginx (HTTPS traffic proxied by Cloudflare)
 
-- **Port 4001**: IPFS Swarm (public, for IPFS network connectivity)
-- **Port 5001**: HTTP RPC API (localhost only, for API service)
-- **Port 8080**: HTTP Gateway (localhost only, for content serving)
+**Nginx Routing:**
+- `/health`, `/events`, `/snapshot`, `/index-pointer` → API Service (port 3000)
+- `/api/v0/*` → IPFS RPC API (port 5001)
+- All other paths → IPFS Gateway (port 8080)
 
-Security group additionally opens:
-- **Port 22**: SSH (for management)
-- **Port 80/443**: HTTP/HTTPS (for future API service)
+**Security Group:**
+- `22/tcp` - SSH (for management)
+- `80/tcp` - HTTP (Cloudflare origin)
+- `443/tcp` - HTTPS (for future direct SSL)
+- `4001/tcp` - IPFS Swarm (P2P network)
 
 ## Instance Management
 
@@ -159,51 +198,60 @@ ssh -i ~/.ssh/arke-ipfs-key.pem ubuntu@<public-ip>
 ### View Service Status
 
 ```bash
-docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.nginx.yml ps
 ```
 
 ### View Logs
 
 ```bash
-# Follow logs (Ctrl+C to exit)
-docker compose -f docker-compose.prod.yml logs -f
+# All services
+docker compose -f docker-compose.nginx.yml logs -f
 
-# View last 100 lines
-docker compose -f docker-compose.prod.yml logs --tail=100
+# Specific service
+docker logs ipfs-api -f
+docker logs ipfs-node-prod -f
+docker logs ipfs-nginx -f
+
+# Last 100 lines
+docker compose -f docker-compose.nginx.yml logs --tail=100
 ```
 
 ### Restart Services
 
 ```bash
-docker compose -f docker-compose.prod.yml restart
+# All services
+docker compose -f docker-compose.nginx.yml restart
+
+# Specific service
+docker restart ipfs-api
 ```
 
 ### Stop Services
 
 ```bash
-docker compose -f docker-compose.prod.yml down
+docker compose -f docker-compose.nginx.yml down
 ```
 
 ### Start Services
 
 ```bash
-docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.nginx.yml up -d
 ```
 
 ### Update Code/Configuration
 
-From your local machine, upload new files and restart:
+From your local machine:
 
 ```bash
-# Upload specific file
+# Upload updated files
 scp -i ~/.ssh/arke-ipfs-key.pem \
-    docker-compose.prod.yml \
+    -r api/ nginx.conf docker-compose.nginx.yml \
     ubuntu@<public-ip>:~/ipfs-server/
 
 # SSH in and restart
 ssh -i ~/.ssh/arke-ipfs-key.pem ubuntu@<public-ip>
 cd ~/ipfs-server
-docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.nginx.yml up -d --build
 ```
 
 ## Backup and Restore
@@ -236,21 +284,14 @@ On the instance:
 
 ```bash
 cd ~/ipfs-server
-./scripts/restore-from-car.sh backups/arke-{seq}-{timestamp}.car
+CONTAINER_NAME=ipfs-node-prod ./scripts/restore-from-car.sh backups/arke-{seq}-{timestamp}.car
 ```
 
-Or upload and restore from local:
+Or use automated deployment with restoration:
 
 ```bash
-# Upload CAR file
-scp -i ~/.ssh/arke-ipfs-key.pem \
-    ./backups/arke-*.car \
-    ubuntu@<public-ip>:~/ipfs-server/backups/
-
-# SSH and restore
-ssh -i ~/.ssh/arke-ipfs-key.pem ubuntu@<public-ip>
-cd ~/ipfs-server
-./scripts/restore-from-car.sh backups/arke-{seq}-{timestamp}.car
+# From local machine - deploys and asks to restore
+./scripts/setup-instance.sh 54.123.45.67
 ```
 
 ## Monitoring and Maintenance
@@ -259,6 +300,13 @@ cd ~/ipfs-server
 
 ```bash
 curl -X POST http://localhost:5001/api/v0/repo/stat | jq .
+```
+
+### Check API Service Health
+
+```bash
+curl https://ipfs-api.arke.institute/health
+curl https://ipfs-api.arke.institute/index-pointer
 ```
 
 ### Check Connected Peers
@@ -279,12 +327,10 @@ df -h
 docker stats
 ```
 
-### View System Resources
+### View Nginx Access Logs
 
 ```bash
-htop  # Interactive (install with: sudo apt install htop)
-# or
-top
+docker exec ipfs-nginx tail -f /var/log/nginx/access.log
 ```
 
 ## Scaling and Upgrades
@@ -295,10 +341,10 @@ If you need more resources:
 
 1. Stop services:
    ```bash
-   docker compose -f docker-compose.prod.yml down
+   docker compose -f docker-compose.nginx.yml down
    ```
 
-2. In AWS Console or CLI, stop instance and change instance type:
+2. Stop instance and change type:
    ```bash
    aws ec2 stop-instances --instance-ids <instance-id>
    aws ec2 modify-instance-attribute \
@@ -309,7 +355,7 @@ If you need more resources:
 
 3. Start services:
    ```bash
-   docker compose -f docker-compose.prod.yml up -d
+   docker compose -f docker-compose.nginx.yml up -d
    ```
 
 ### Expand EBS Volume
@@ -332,17 +378,48 @@ If you need more storage:
 - Verify key permissions: `chmod 400 ~/.ssh/arke-ipfs-key.pem`
 - Check instance is running: `aws ec2 describe-instances --instance-ids <id>`
 
-### IPFS Not Starting
+### Services Not Starting
 
 ```bash
 # Check logs
-docker compose -f docker-compose.prod.yml logs ipfs
+docker compose -f docker-compose.nginx.yml logs
 
-# Check if container is running
+# Check if containers are running
 docker ps -a
 
-# Try restart
-docker compose -f docker-compose.prod.yml restart
+# Rebuild and restart
+docker compose -f docker-compose.nginx.yml up -d --build
+```
+
+### API Service Errors
+
+```bash
+# Check API logs
+docker logs ipfs-api --tail 50
+
+# Restart API service
+docker restart ipfs-api
+```
+
+### Can't Access via Domain
+
+- Verify DNS A records point to correct IP
+- Check DNS propagation: `dig ipfs-api.arke.institute`
+- Ensure Cloudflare SSL/TLS mode is "Flexible"
+- Check Cloudflare proxy status is enabled (orange cloud)
+- Test direct IP access to isolate DNS issues
+
+### Nginx Routing Issues
+
+```bash
+# Check nginx config
+docker exec ipfs-nginx cat /etc/nginx/nginx.conf
+
+# Test nginx config
+docker exec ipfs-nginx nginx -t
+
+# Restart nginx
+docker restart ipfs-nginx
 ```
 
 ### Out of Disk Space
@@ -354,54 +431,33 @@ df -h
 # Clean up Docker
 docker system prune -a
 
+# Check IPFS repo size
+curl -X POST http://localhost:5001/api/v0/repo/stat
+
 # Consider expanding EBS volume (see Scaling section)
 ```
 
-### Can't Access via Domain
+## Security Notes
 
-- Verify DNS A record points to correct IP
-- Check DNS propagation: `dig ipfs.yourdomain.com`
-- If using Cloudflare proxy, ensure SSL/TLS mode is correct
-- Test direct IP access first to isolate DNS issues
+Current setup uses:
+- **Rate limiting**: 1000 req/s for API, 500 req/s for Gateway (configured for MVP testing)
+- **Security headers**: X-Frame-Options, X-Content-Type-Options, X-XSS-Protection
+- **Connection limits**: 200 concurrent for API, 100 for Gateway
+- **Cloudflare DDoS protection**: Via proxied DNS
 
-## Security Hardening
-
-The current setup is "open for now" as requested, but consider these hardening steps for production:
-
-1. **Restrict SSH access**:
-   ```bash
-   # Modify security group to allow SSH only from your IP
-   aws ec2 authorize-security-group-ingress \
-       --group-id <sg-id> \
-       --protocol tcp --port 22 \
-       --cidr <your-ip>/32
-   ```
-
-2. **Set up firewall (ufw)**:
-   ```bash
-   sudo ufw allow 22/tcp
-   sudo ufw allow 4001/tcp
-   sudo ufw enable
-   ```
-
-3. **Enable automatic security updates**:
-   ```bash
-   sudo apt install unattended-upgrades
-   sudo dpkg-reconfigure -plow unattended-upgrades
-   ```
-
-4. **Set up CloudWatch monitoring** for logs and metrics
-
-5. **Enable EBS encryption** for data at rest
-
-6. **Use AWS Secrets Manager** for sensitive configuration
+For production hardening:
+1. Reduce rate limits to production values
+2. Restrict SSH access to specific IPs
+3. Enable automatic security updates
+4. Set up CloudWatch monitoring
+5. Enable EBS encryption
 
 ## Cost Estimation
 
 Current configuration (us-east-1):
 - **t3.small instance**: ~$15/month
 - **30GB gp3 EBS**: ~$2.40/month
-- **Data transfer**: Variable (typically minimal for API usage)
+- **Data transfer**: Variable (Cloudflare bandwidth is free)
 
 **Total**: ~$17-20/month
 
@@ -432,10 +488,10 @@ rm deployment-info.txt
 
 ## Support
 
-For IPFS-specific issues, see:
+For documentation:
 - `README.md` - Basic operations
 - `API_WALKTHROUGH.md` - API integration guide
 - `DISASTER_RECOVERY.md` - DR procedures
 - `CLAUDE.md` - Project architecture
 
-For AWS issues, consult AWS documentation or your AWS support plan.
+For issues, consult AWS or Cloudflare documentation.

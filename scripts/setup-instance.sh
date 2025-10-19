@@ -5,12 +5,20 @@ set -e
 # This script runs LOCALLY and sets up the remote EC2 instance
 
 if [ -z "$1" ]; then
-    echo "Usage: ./scripts/setup-instance.sh <public-ip>"
+    echo "Usage: ./scripts/setup-instance.sh <public-ip> [--no-restore]"
     echo "Example: ./scripts/setup-instance.sh 54.123.45.67"
+    echo "         ./scripts/setup-instance.sh 54.123.45.67 --no-restore"
     exit 1
 fi
 
 PUBLIC_IP=$1
+RESTORE_BACKUP="prompt"  # Default: prompt user
+
+# Check for --no-restore flag
+if [ "$2" = "--no-restore" ]; then
+    RESTORE_BACKUP="no"
+fi
+
 KEY_FILE="$HOME/.ssh/arke-ipfs-key.pem"
 SSH_USER="ubuntu"
 REMOTE_DIR="/home/ubuntu/ipfs-server"
@@ -69,8 +77,6 @@ echo -e "${BLUE}Step 3: Uploading project files...${NC}"
 
 # Create list of files to upload
 FILES_TO_UPLOAD=(
-    "docker-compose.prod.yml"
-    "docker-compose.public.yml"
     "docker-compose.nginx.yml"
     "nginx.conf"
     "README.md"
@@ -86,8 +92,12 @@ scp -i "$KEY_FILE" -o StrictHostKeyChecking=no \
     scripts/export-car.sh \
     scripts/restore-from-car.sh \
     scripts/verify-entity.sh \
-    scripts/switch-public-access.sh \
     "$SSH_USER@$PUBLIC_IP:$REMOTE_DIR/scripts/"
+
+# Upload API service directory
+echo -e "  Uploading API service..."
+scp -i "$KEY_FILE" -o StrictHostKeyChecking=no -r \
+    api/ "$SSH_USER@$PUBLIC_IP:$REMOTE_DIR/"
 
 # Upload main files
 for file in "${FILES_TO_UPLOAD[@]}"; do
@@ -130,9 +140,9 @@ ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no "$SSH_USER@$PUBLIC_IP" << 'ENDSSH
 cd ~/ipfs-server
 # Use newgrp to get docker group permissions without logout
 newgrp docker << 'ENDNEWGRP'
-docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.nginx.yml up -d --build
 sleep 5
-docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.nginx.yml ps
 ENDNEWGRP
 ENDSSH
 echo -e "${GREEN}✓ Services started${NC}"
@@ -141,12 +151,23 @@ echo ""
 # Check if we should restore from backup
 if ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no "$SSH_USER@$PUBLIC_IP" \
     "ls $REMOTE_DIR/backups/*.car 1> /dev/null 2>&1"; then
-    echo -e "${BLUE}========================================${NC}"
-    echo -e "${YELLOW}Backup file found on instance!${NC}"
-    echo ""
-    echo -e "Would you like to restore from backup? (y/n)"
-    read -r response
-    if [[ "$response" =~ ^[Yy]$ ]]; then
+
+    if [ "$RESTORE_BACKUP" = "no" ]; then
+        echo -e "${BLUE}========================================${NC}"
+        echo -e "${YELLOW}Backup file found but skipping restore (--no-restore flag)${NC}"
+        echo ""
+    elif [ "$RESTORE_BACKUP" = "prompt" ]; then
+        echo -e "${BLUE}========================================${NC}"
+        echo -e "${YELLOW}Backup file found on instance!${NC}"
+        echo ""
+        echo -e "Would you like to restore from backup? (y/n)"
+        read -r response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            RESTORE_BACKUP="yes"
+        fi
+    fi
+
+    if [ "$RESTORE_BACKUP" = "yes" ]; then
         echo -e "${BLUE}Restoring from backup...${NC}"
         CAR_FILE=$(ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no "$SSH_USER@$PUBLIC_IP" \
             "ls -t $REMOTE_DIR/backups/*.car | head -1")
@@ -170,16 +191,26 @@ echo -e "  SSH to instance:"
 echo -e "    ${YELLOW}ssh -i $KEY_FILE $SSH_USER@$PUBLIC_IP${NC}"
 echo ""
 echo -e "  Check service status:"
-echo -e "    ${YELLOW}docker compose -f docker-compose.prod.yml ps${NC}"
+echo -e "    ${YELLOW}docker compose -f docker-compose.nginx.yml ps${NC}"
 echo ""
 echo -e "  View logs:"
-echo -e "    ${YELLOW}docker compose -f docker-compose.prod.yml logs -f${NC}"
+echo -e "    ${YELLOW}docker compose -f docker-compose.nginx.yml logs -f${NC}"
+echo -e "    ${YELLOW}docker logs ipfs-api -f${NC}  # API service logs"
 echo ""
 echo -e "  Test IPFS API:"
 echo -e "    ${YELLOW}curl -X POST http://localhost:5001/api/v0/version${NC}"
 echo ""
+echo -e "${GREEN}Services deployed:${NC}"
+echo -e "  - IPFS/Kubo node (port 5001/8080)"
+echo -e "  - API Service (port 3000)"
+echo -e "  - Nginx reverse proxy (ports 80/443)"
+echo ""
 echo -e "${GREEN}Next steps:${NC}"
-echo -e "  1. Add DNS A record in Cloudflare pointing to: ${YELLOW}$PUBLIC_IP${NC}"
-echo -e "  2. Deploy your API service to this instance"
-echo -e "  3. Configure API service to connect to: ${YELLOW}http://localhost:5001${NC}"
+echo -e "  1. Add DNS A records in Cloudflare pointing to: ${YELLOW}$PUBLIC_IP${NC}"
+echo -e "     - ipfs-api.arke.institute → $PUBLIC_IP"
+echo -e "     - ipfs.arke.institute → $PUBLIC_IP"
+echo -e "  2. Set Cloudflare SSL/TLS mode to 'Flexible'"
+echo -e "  3. Test endpoints:"
+echo -e "     ${YELLOW}https://ipfs-api.arke.institute/health${NC}"
+echo -e "     ${YELLOW}https://ipfs-api.arke.institute/events${NC}"
 echo ""
