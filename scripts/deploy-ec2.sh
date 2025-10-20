@@ -129,13 +129,27 @@ echo ""
 
 # Step 4: Launch EC2 Instance
 echo -e "${BLUE}Step 4: Launching EC2 instance...${NC}"
+
+# Check if IAM instance profile exists (optional but recommended for S3 backups)
+IAM_PROFILE_NAME="arke-ipfs-ec2-backup-role"
+IAM_PROFILE_ARG=""
+
+if aws iam get-instance-profile --instance-profile-name "$IAM_PROFILE_NAME" &> /dev/null; then
+    echo -e "  Using IAM instance profile: ${YELLOW}$IAM_PROFILE_NAME${NC}"
+    IAM_PROFILE_ARG="--iam-instance-profile Name=$IAM_PROFILE_NAME"
+else
+    echo -e "  ${YELLOW}IAM instance profile not found (S3 backups won't work)${NC}"
+    echo -e "  ${YELLOW}Run ./scripts/create-iam-role.sh to create it${NC}"
+fi
+
 INSTANCE_ID=$(aws ec2 run-instances \
     --image-id "$AMI_ID" \
     --instance-type "$INSTANCE_TYPE" \
     --key-name "$KEY_NAME" \
     --security-group-ids "$SG_ID" \
+    $IAM_PROFILE_ARG \
     --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$VOLUME_SIZE,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME}]" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME}]" "ResourceType=volume,Tags=[{Key=Name,Value=$INSTANCE_NAME}]" \
     --region "$REGION" \
     --query 'Instances[0].InstanceId' \
     --output text)

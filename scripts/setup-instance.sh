@@ -5,19 +5,38 @@ set -e
 # This script runs LOCALLY and sets up the remote EC2 instance
 
 if [ -z "$1" ]; then
-    echo "Usage: ./scripts/setup-instance.sh <public-ip> [--no-restore]"
+    echo "Usage: ./scripts/setup-instance.sh <public-ip> [OPTIONS]"
     echo "Example: ./scripts/setup-instance.sh 54.123.45.67"
     echo "         ./scripts/setup-instance.sh 54.123.45.67 --no-restore"
+    echo "         ./scripts/setup-instance.sh 54.123.45.67 --upload-backup"
+    echo ""
+    echo "Options:"
+    echo "  --no-restore      Skip backup restoration (don't prompt)"
+    echo "  --upload-backup   Upload local CAR backup to instance"
     exit 1
 fi
 
 PUBLIC_IP=$1
 RESTORE_BACKUP="prompt"  # Default: prompt user
+UPLOAD_BACKUP="no"       # Default: don't upload backup
 
-# Check for --no-restore flag
-if [ "$2" = "--no-restore" ]; then
-    RESTORE_BACKUP="no"
-fi
+# Parse flags
+shift
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-restore)
+            RESTORE_BACKUP="no"
+            ;;
+        --upload-backup)
+            UPLOAD_BACKUP="yes"
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+    shift
+done
 
 KEY_FILE="$HOME/.ssh/arke-ipfs-key.pem"
 SSH_USER="ubuntu"
@@ -108,8 +127,8 @@ for file in "${FILES_TO_UPLOAD[@]}"; do
     fi
 done
 
-# Upload most recent CAR backup and metadata if exists
-if ls backups/*.car 1> /dev/null 2>&1; then
+# Upload most recent CAR backup and metadata if requested
+if [ "$UPLOAD_BACKUP" = "yes" ] && ls backups/*.car 1> /dev/null 2>&1; then
     LATEST_CAR=$(ls -t backups/*.car | head -1)
     echo -e "  Uploading backup: $LATEST_CAR..."
     scp -i "$KEY_FILE" -o StrictHostKeyChecking=no \
@@ -122,6 +141,8 @@ if ls backups/*.car 1> /dev/null 2>&1; then
         scp -i "$KEY_FILE" -o StrictHostKeyChecking=no \
             "$METADATA_JSON" "$SSH_USER@$PUBLIC_IP:$REMOTE_DIR/backups/"
     fi
+elif [ "$UPLOAD_BACKUP" = "no" ]; then
+    echo -e "  ${YELLOW}Skipping backup upload (use --upload-backup to enable)${NC}"
 fi
 
 echo -e "${GREEN}✓ Project files uploaded${NC}"
