@@ -149,13 +149,6 @@ async def trigger_scheduled_snapshot():
 
     print(f"⏰ Scheduled snapshot trigger (total PIs: {pointer.total_count}, total events: {pointer.event_count})")
 
-    # Path to build-snapshot.sh script (inside container: /app/scripts/)
-    script_path = "/app/scripts/build-snapshot.sh"
-    log_path = "/app/logs/snapshot-build.log"
-
-    # Ensure logs directory exists
-    Path("/app/logs").mkdir(exist_ok=True)
-
     # Update trigger timestamp
     trigger_time = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
     pointer.last_snapshot_trigger = trigger_time
@@ -163,25 +156,34 @@ async def trigger_scheduled_snapshot():
     await index_pointer.update_index_pointer(pointer, timeout=600.0)
 
     # Trigger snapshot build in background (fire-and-forget)
+    # Run in thread pool to avoid blocking async event loop
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _run_snapshot_build, trigger_time, pointer.total_count, pointer.event_count)
+
+def _run_snapshot_build(trigger_time: str, total_pis: int, total_events: int):
+    """
+    Run snapshot build in thread pool to avoid blocking async loop.
+    This calls the DR Python script directly.
+    """
+    log_path = Path("/app/logs/snapshot-build.log")
+    log_path.parent.mkdir(exist_ok=True)
+
     try:
         with open(log_path, 'a') as log_file:
             log_file.write(f"\n{'='*60}\n")
-            log_file.write(f"[SCHEDULED] Snapshot build triggered at {trigger_time}\n")
-            log_file.write(f"Total PIs: {pointer.total_count}\n")
-            log_file.write(f"Total events: {pointer.event_count}\n")
+            log_file.write(f"[SCHEDULED] Snapshot build at {trigger_time}\n")
+            log_file.write(f"Total PIs: {total_pis}\n")
+            log_file.write(f"Total events: {total_events}\n")
             log_file.write(f"{'='*60}\n\n")
 
-            subprocess.Popen(
-                [script_path],
+            # Run build_snapshot.py as subprocess
+            subprocess.run(
+                ["python3", "-m", "dr.build_snapshot"],
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 cwd="/app",
-                env={
-                    **os.environ,
-                    "CONTAINER_NAME": "ipfs-node",
-                    "IPFS_API_URL": settings.IPFS_API_URL
-                }
+                check=False  # Don't raise on error, just log
             )
-        print(f"✅ Snapshot build triggered in background (logging to {log_path})")
+        print(f"✅ Snapshot build completed (see {log_path})")
     except Exception as e:
-        print(f"❌ Failed to trigger snapshot build: {e}")
+        print(f"❌ Snapshot build failed: {e}")

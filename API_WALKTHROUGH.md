@@ -130,7 +130,7 @@ curl -X POST \
 - `input-codec=dag-json` - Input is DAG-JSON (CRITICAL: ensures IPLD links are properly typed!)
 - `pin=true` - Pin the manifest (important!)
 
-**IMPORTANT:** Must use `input-codec=dag-json` (NOT `json`) to ensure `{"/":"cid"}` links are encoded as typed IPLD links (CBOR tag-42). Using `json` creates fake links that break DAG traversal and CAR exports. See `scripts/dr/DAG_JSON_VS_JSON.md` for details.
+**IMPORTANT:** Must use `input-codec=dag-json` (NOT `json`) to ensure `{"/":"cid"}` links are encoded as typed IPLD links (CBOR tag-42). Using `json` creates fake links that break DAG traversal and CAR exports. See `api/dr/DAG_JSON_VS_JSON.md` for details.
 
 **Response:**
 ```json

@@ -45,3 +45,6 @@ backups/
 
 # Deployment artifacts (instance-specific, not checked in)
 deployment-info.txt
+
+
+backups-test/*

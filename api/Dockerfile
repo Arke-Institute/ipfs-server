@@ -2,8 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install curl and jq for snapshot scripts
-RUN apt-get update && apt-get install -y curl jq && rm -rf /var/lib/apt/lists/*
+# Install system dependencies for DR operations
+# - docker-cli: For docker exec commands to ipfs-node
+# - curl/jq: For direct IPFS API calls
+RUN apt-get update && apt-get install -y \
+    curl \
+    jq \
+    docker.io \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

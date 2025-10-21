@@ -33,11 +33,12 @@ services:
     environment:
       # Override IPFS_API_URL for internal Docker networking
       - IPFS_API_URL=http://ipfs:5001/api/v0
+      # Tell DR scripts which container to docker exec into
+      - CONTAINER_NAME=ipfs-node
     volumes:
-      - ./scripts:/app/scripts:ro   # Mount scripts for snapshot triggering
       - ./snapshots:/app/snapshots  # Mount snapshots directory
       - ./backups:/app/backups      # Mount backups directory
-      - ./.env:/app/.env:ro         # Mount .env for scripts
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker socket for DR scripts
     depends_on:
       - ipfs
     restart: unless-stopped

@@ -20,7 +20,7 @@ from typing import Dict, Any
 import httpx
 
 # Configuration
-IPFS_API = os.getenv("IPFS_API", "http://localhost:5001/api/v0")
+IPFS_API = os.getenv("IPFS_API_URL", os.getenv("IPFS_API", "http://localhost:5001/api/v0"))
 CONTAINER_NAME = os.getenv("CONTAINER_NAME", "ipfs-node")
 INDEX_ROOT = "/arke/index"
 INDEX_POINTER_PATH = "/arke/index-pointer"
@@ -46,9 +46,37 @@ def error(msg: str):
     print(f"{RED}[ERROR]{NC} {msg}", file=sys.stderr)
     sys.exit(1)
 
+def wait_for_ipfs(max_retries=30, delay=2):
+    """Wait for IPFS node to be ready."""
+    import time
+
+    log("Waiting for IPFS node to be ready...")
+
+    for i in range(max_retries):
+        try:
+            result = subprocess.run(
+                ["docker", "exec", CONTAINER_NAME, "ipfs", "id"],
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                success("IPFS node is ready")
+                return True
+        except:
+            pass
+
+        if i < max_retries - 1:
+            time.sleep(delay)
+            log(f"  Waiting... ({i+1}/{max_retries})")
+
+    error("IPFS node did not become ready in time")
+
 def import_car_file(car_path: Path):
     """Import CAR file using docker exec."""
     log(f"Importing CAR: {car_path.name}")
+
+    # Wait for IPFS to be ready first
+    wait_for_ipfs()
 
     # Copy to container
     container_path = f"/tmp/{car_path.name}"
