@@ -34,8 +34,13 @@ async def get_index_pointer() -> IndexPointer:
             )
         raise
 
-async def update_index_pointer(pointer: IndexPointer):
-    """Write index pointer to MFS."""
+async def update_index_pointer(pointer: IndexPointer, timeout: float = 60.0):
+    """Write index pointer to MFS.
+
+    Args:
+        pointer: IndexPointer to write
+        timeout: HTTP timeout in seconds (default 60s, increase for large operations)
+    """
     pointer.last_updated = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
     # Convert to JSON
@@ -52,6 +57,6 @@ async def update_index_pointer(pointer: IndexPointer):
                 "parents": "true"
             },
             files={"file": ("pointer.json", data.encode(), "application/json")},
-            timeout=10.0
+            timeout=timeout
         )
         response.raise_for_status()

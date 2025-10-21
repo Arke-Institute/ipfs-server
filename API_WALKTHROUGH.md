@@ -122,13 +122,15 @@ curl -X POST \
     "children_pi": ["01GX...", "01GZ..."],
     "note": "Initial version"
   }' \
-  "http://localhost:5001/api/v0/dag/put?store-codec=dag-cbor&input-codec=json&pin=true"
+  "http://localhost:5001/api/v0/dag/put?store-codec=dag-cbor&input-codec=dag-json&pin=true"
 ```
 
 **Query Parameters:**
 - `store-codec=dag-cbor` - Store as CBOR (efficient binary)
-- `input-codec=json` - Input is JSON
+- `input-codec=dag-json` - Input is DAG-JSON (CRITICAL: ensures IPLD links are properly typed!)
 - `pin=true` - Pin the manifest (important!)
+
+**IMPORTANT:** Must use `input-codec=dag-json` (NOT `json`) to ensure `{"/":"cid"}` links are encoded as typed IPLD links (CBOR tag-42). Using `json` creates fake links that break DAG traversal and CAR exports. See `scripts/dr/DAG_JSON_VS_JSON.md` for details.
 
 **Response:**
 ```json
@@ -292,7 +294,7 @@ curl -X POST \
     "children_pi": ["01GX...", "01ABC..."],
     "note": "Updated metadata"
   }' \
-  "http://localhost:5001/api/v0/dag/put?store-codec=dag-cbor&input-codec=json&pin=true"
+  "http://localhost:5001/api/v0/dag/put?store-codec=dag-cbor&input-codec=dag-json&pin=true"
 ```
 
 **Response:**
@@ -911,7 +913,7 @@ curl -X POST \
     "children_pi": [],
     "note": "Initial profile"
   }' \
-  "http://localhost:5001/api/v0/dag/put?store-codec=dag-cbor&input-codec=json&pin=true"
+  "http://localhost:5001/api/v0/dag/put?store-codec=dag-cbor&input-codec=dag-json&pin=true"
 # → {"Cid":{"/":"bafyreiv1abc..."}}
 
 # 4. Create directory
@@ -945,7 +947,7 @@ curl -X POST \
     "children_pi": [],
     "note": "Updated name and title"
   }' \
-  "http://localhost:5001/api/v0/dag/put?store-codec=dag-cbor&input-codec=json&pin=true"
+  "http://localhost:5001/api/v0/dag/put?store-codec=dag-cbor&input-codec=dag-json&pin=true"
 # → {"Cid":{"/":"bafyreiv2xyz..."}}
 
 # 8. Update .tip
@@ -1121,7 +1123,7 @@ async function uploadFile(filePath: string): Promise<string> {
 // Store manifest
 async function storeManifest(manifest: any): Promise<string> {
   const response = await fetch(
-    `${IPFS_API}/dag/put?store-codec=dag-cbor&input-codec=json&pin=true`,
+    `${IPFS_API}/dag/put?store-codec=dag-cbor&input-codec=dag-json&pin=true`,  // CRITICAL: dag-json!
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1193,7 +1195,7 @@ def store_manifest(manifest):
         f"{IPFS_API}/dag/put",
         params={
             'store-codec': 'dag-cbor',
-            'input-codec': 'json',
+            'input-codec': 'dag-json',  # CRITICAL: use dag-json for proper IPLD links!
             'pin': True
         },
         json=manifest

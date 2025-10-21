@@ -42,7 +42,7 @@ mkdir -p "$BACKUP_DIR" "$SNAPSHOT_DIR"
 
 # Step 1: Build snapshot
 log "Step 1/4: Building snapshot..."
-if CONTAINER_NAME=ipfs-node-prod "$SCRIPT_DIR/build-snapshot.sh" >> "$LOG_FILE" 2>&1; then
+if CONTAINER_NAME=ipfs-node-prod "$SCRIPT_DIR/dr/build-snapshot.py" >> "$LOG_FILE" 2>&1; then
     log_success "Snapshot built successfully"
 else
     log_error "Failed to build snapshot"
@@ -51,7 +51,7 @@ fi
 
 # Step 2: Export to CAR
 log "Step 2/4: Exporting CAR file..."
-if CONTAINER_NAME=ipfs-node-prod "$SCRIPT_DIR/export-car.sh" >> "$LOG_FILE" 2>&1; then
+if CONTAINER_NAME=ipfs-node-prod "$SCRIPT_DIR/dr/export-car.py" >> "$LOG_FILE" 2>&1; then
     log_success "CAR file exported successfully"
     LATEST_CAR=$(ls -t "$BACKUP_DIR"/arke-*.car 2>/dev/null | head -1)
     if [ -n "$LATEST_CAR" ]; then
@@ -98,7 +98,7 @@ log "  Current backups: $CURRENT_COUNT file(s)"
 log "Step 4/4: Uploading to S3..."
 if command -v aws &> /dev/null; then
     if [ -n "$LATEST_CAR" ] && [ -f "$LATEST_CAR" ]; then
-        if "$SCRIPT_DIR/upload-to-s3.sh" "$LATEST_CAR" >> "$LOG_FILE" 2>&1; then
+        if "$SCRIPT_DIR/deploy/upload-to-s3.sh" "$LATEST_CAR" >> "$LOG_FILE" 2>&1; then
             log_success "CAR file uploaded to S3"
         else
             log_error "Failed to upload to S3 (continuing anyway)"

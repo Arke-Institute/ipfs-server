@@ -1,0 +1,58 @@
+version: '3.8'
+
+# Test environment for DR testing with isolated volumes
+# Use with: docker-compose -f docker-compose.test.yml up -d
+
+services:
+  ipfs-test:
+    image: ipfs/kubo:latest
+    container_name: ipfs-node-test
+    environment:
+      - IPFS_PROFILE=server
+    ports:
+      - "14001:4001"     # P2P (Swarm) - different from prod
+      - "15001:5001"     # HTTP RPC API - different from prod
+      - "18080:8080"     # HTTP Gateway - different from prod
+    volumes:
+      - ipfs_test_data:/data/ipfs
+      - ipfs_test_staging:/export
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "ipfs id || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  ipfs-api-test:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: ipfs-api-test
+    ports:
+      - "3001:3000"     # Different port from main API
+    env_file:
+      - .env
+    environment:
+      # Point to test IPFS node
+      - IPFS_API_URL=http://ipfs-test:5001/api/v0
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ./snapshots:/app/snapshots
+      - ./backups:/app/backups
+      - ./.env:/app/.env:ro
+    depends_on:
+      - ipfs-test
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  ipfs_test_data:
+    driver: local
+  ipfs_test_staging:
+    driver: local

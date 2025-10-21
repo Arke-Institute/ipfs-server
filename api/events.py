@@ -159,7 +159,8 @@ async def trigger_scheduled_snapshot():
     # Update trigger timestamp
     trigger_time = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
     pointer.last_snapshot_trigger = trigger_time
-    await index_pointer.update_index_pointer(pointer)
+    # Increase timeout for large datasets (31k+ entities)
+    await index_pointer.update_index_pointer(pointer, timeout=600.0)
 
     # Trigger snapshot build in background (fire-and-forget)
     try:
