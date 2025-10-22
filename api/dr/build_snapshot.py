@@ -86,12 +86,137 @@ def get_index_pointer() -> Dict[str, Any]:
     except Exception as e:
         error(f"Failed to read index pointer: {e}")
 
+def load_previous_snapshot(snapshot_cid: str) -> Dict[str, Any]:
+    """Load previous snapshot and return entries as dict keyed by PI."""
+    log(f"Loading previous snapshot: {snapshot_cid[:16]}...")
+
+    with httpx.Client(timeout=TIMEOUT) as client:
+        response = client.post(
+            f"{IPFS_API}/dag/get",
+            params={"arg": snapshot_cid}
+        )
+        response.raise_for_status()
+        snapshot = response.json()
+
+    entries_dict = {e["pi"]: e for e in snapshot.get("entries", [])}
+    success(f"Loaded {len(entries_dict)} entries from previous snapshot")
+    return entries_dict, snapshot
+
+def walk_event_chain_incremental(event_head: str, stop_at_cid: str, prev_entries: Dict[str, Any], checkpoint_file: Path) -> tuple[int, int]:
+    """
+    Walk ONLY new events from event_head back to stop_at_cid.
+    Update prev_entries dict for modified/new PIs.
+    Returns (events_processed, pis_modified).
+    """
+    log(f"Walking new events from {event_head[:16]}... to {stop_at_cid[:16]}...")
+
+    current = event_head
+    events_processed = 0
+    pis_modified = set()
+    start_time = time.time()
+
+    with httpx.Client(timeout=TIMEOUT) as client:
+        while current and current != stop_at_cid:
+            # Fetch event
+            try:
+                response = client.post(
+                    f"{IPFS_API}/dag/get",
+                    params={"arg": current}
+                )
+                response.raise_for_status()
+                event = response.json()
+            except Exception as e:
+                warn(f"Failed to fetch event {current[:16]}: {e}")
+                break
+
+            events_processed += 1
+
+            # Extract PI
+            pi = event.get("pi")
+            ts = event.get("ts")
+
+            if not pi:
+                warn(f"Event {current[:16]} has no PI, skipping")
+                prev_obj = event.get("prev")
+                if not prev_obj:
+                    break
+                current = prev_obj.get("/") if isinstance(prev_obj, dict) else prev_obj
+                continue
+
+            # Track that we modified/added this PI
+            pis_modified.add(pi)
+
+            # Read current tip from MFS
+            shard1 = pi[:2]
+            shard2 = pi[2:4]
+            tip_path = f"/arke/index/{shard1}/{shard2}/{pi}.tip"
+
+            try:
+                response = client.post(
+                    f"{IPFS_API}/files/read",
+                    params={"arg": tip_path}
+                )
+                response.raise_for_status()
+                tip_cid = response.text.strip()
+            except Exception as e:
+                warn(f"Failed to read tip for {pi}: {e}")
+                prev_obj = event.get("prev")
+                if not prev_obj:
+                    break
+                current = prev_obj.get("/") if isinstance(prev_obj, dict) else prev_obj
+                continue
+
+            # Fetch manifest to get version
+            try:
+                response = client.post(
+                    f"{IPFS_API}/dag/get",
+                    params={"arg": tip_cid}
+                )
+                response.raise_for_status()
+                manifest = response.json()
+                ver = manifest.get("ver", 0)
+            except Exception as e:
+                warn(f"Failed to fetch manifest for {pi}: {e}")
+                ver = 0
+
+            # Update/add entry in dict
+            prev_entries[pi] = {
+                "pi": pi,
+                "ver": ver,
+                "tip_cid": {"/": tip_cid},
+                "ts": ts,
+                "chain_cid": {"/": current}
+            }
+
+            # Progress logging
+            if events_processed % LOG_INTERVAL == 0:
+                elapsed = time.time() - start_time
+                rate = events_processed / elapsed
+                log(f"Processed {events_processed} new events ({rate:.1f} events/sec, {elapsed:.0f}s elapsed)")
+
+            # Move to previous event
+            prev_obj = event.get("prev")
+            if not prev_obj:
+                break
+            current = prev_obj.get("/") if isinstance(prev_obj, dict) else prev_obj
+
+    elapsed = time.time() - start_time
+    success(f"Incremental walk: {events_processed} events, {len(pis_modified)} PIs modified/added in {elapsed:.1f}s")
+
+    # Write all entries to checkpoint file
+    log("Writing entries to checkpoint file...")
+    with open(checkpoint_file, 'w') as f:
+        for entry in prev_entries.values():
+            f.write(json.dumps(entry) + "\n")
+
+    return events_processed, len(pis_modified)
+
 def walk_event_chain(event_head: str, checkpoint_file: Path) -> int:
     """
-    Walk event chain and write entries to checkpoint file.
+    Walk entire event chain and write entries to checkpoint file.
     Returns count of unique PIs processed.
     """
-    log(f"Walking event chain from head: {event_head[:16]}...")
+    log(f"Walking ENTIRE event chain from head: {event_head[:16]}...")
     log(f"Checkpoint file: {checkpoint_file}")
 
     current = event_head
@@ -202,7 +327,7 @@ def walk_event_chain(event_head: str, checkpoint_file: Path) -> int:
                     break
 
     elapsed = time.time() - start_time
-    success(f"Collected {count} unique PIs in {elapsed:.0f}s ({count/elapsed:.1f} entries/sec)")
+    success(f"Full traversal: {count} unique PIs in {elapsed:.0f}s ({count/elapsed:.1f} entries/sec)")
     return count
 
 def build_snapshot_json(checkpoint_file: Path, pointer: Dict[str, Any], seq: int, timestamp: str, total_count: int) -> Dict[str, Any]:
@@ -340,14 +465,54 @@ def main():
         new_seq = prev_seq + 1
         timestamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
+        # Check for previous snapshot
+        prev_snapshot_cid = pointer.get("latest_snapshot_cid")
+        prev_event_cid = pointer.get("snapshot_event_cid")
+
         log(f"Starting snapshot build (seq={new_seq})")
+        log(f"DEBUG: prev_snapshot_cid={prev_snapshot_cid[:16] if prev_snapshot_cid else 'None'}...")
+        log(f"DEBUG: prev_event_cid={prev_event_cid[:16] if prev_event_cid else 'None'}...")
+        log(f"DEBUG: event_head={event_head[:16]}...")
 
         # Phase 1: Walk event chain and write to checkpoint
         log("=" * 60)
         log("PHASE 1: Collecting entries from event chain")
         log("=" * 60)
 
-        total_count = walk_event_chain(event_head, CHECKPOINT_FILE)
+        # Decide: incremental or full traversal
+        if prev_snapshot_cid and prev_event_cid:
+            if event_head == prev_event_cid:
+                log("No new events since last snapshot - skipping build")
+                cleanup_lock()
+                return
+
+            log(f"Mode: INCREMENTAL (from snapshot seq {prev_seq})")
+            log(f"Previous snapshot: {prev_snapshot_cid[:16]}...")
+            log(f"Event range: {prev_event_cid[:16]}... → {event_head[:16]}...")
+
+            # Load previous entries as baseline
+            prev_entries, prev_snapshot = load_previous_snapshot(prev_snapshot_cid)
+
+            # Walk only new events
+            events_processed, pis_modified = walk_event_chain_incremental(
+                event_head, prev_event_cid, prev_entries, CHECKPOINT_FILE
+            )
+
+            total_count = len(prev_entries)
+
+            log("")
+            log("=" * 60)
+            log("Incremental Build Summary")
+            log("=" * 60)
+            log(f"Events processed:  {events_processed}")
+            log(f"PIs modified/new:  {pis_modified}")
+            log(f"PIs unchanged:     {total_count - pis_modified}")
+            log(f"Total PIs:         {total_count}")
+            log("=" * 60)
+
+        else:
+            log("Mode: FULL TRAVERSAL (no previous snapshot)")
+            total_count = walk_event_chain(event_head, CHECKPOINT_FILE)
 
         if total_count == 0:
             error("No entries collected")
