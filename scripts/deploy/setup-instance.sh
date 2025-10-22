@@ -81,7 +81,7 @@ echo ""
 # Upload remote setup script
 echo -e "${BLUE}Step 1: Uploading setup script...${NC}"
 scp -i "$KEY_FILE" -o StrictHostKeyChecking=no \
-    scripts/remote-setup.sh "$SSH_USER@$PUBLIC_IP:/tmp/"
+    scripts/deploy/remote-setup.sh "$SSH_USER@$PUBLIC_IP:/tmp/"
 echo -e "${GREEN}✓ Setup script uploaded${NC}"
 echo ""
 
@@ -104,16 +104,7 @@ FILES_TO_UPLOAD=(
     "DISASTER_RECOVERY.md"
 )
 
-# Upload all DR scripts and utility scripts
-echo -e "  Uploading scripts..."
-scp -i "$KEY_FILE" -o StrictHostKeyChecking=no \
-    scripts/build-snapshot.sh \
-    scripts/export-car.sh \
-    scripts/restore-from-car.sh \
-    scripts/verify-entity.sh \
-    "$SSH_USER@$PUBLIC_IP:$REMOTE_DIR/scripts/"
-
-# Upload API service directory
+# Upload API service directory (includes DR module in api/dr/)
 echo -e "  Uploading API service..."
 scp -i "$KEY_FILE" -o StrictHostKeyChecking=no -r \
     api/ "$SSH_USER@$PUBLIC_IP:$REMOTE_DIR/"
@@ -148,15 +139,11 @@ fi
 echo -e "${GREEN}✓ Project files uploaded${NC}"
 echo ""
 
-# Make scripts executable
-echo -e "${BLUE}Step 4: Making scripts executable...${NC}"
-ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no "$SSH_USER@$PUBLIC_IP" \
-    "chmod +x $REMOTE_DIR/scripts/*.sh"
-echo -e "${GREEN}✓ Scripts are executable${NC}"
-echo ""
+# Scripts directory is no longer used (DR scripts now in api/dr/ module)
+# Skipping chmod step
 
 # Start services
-echo -e "${BLUE}Step 5: Starting IPFS services...${NC}"
+echo -e "${BLUE}Step 4: Starting IPFS services...${NC}"
 ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no "$SSH_USER@$PUBLIC_IP" << 'ENDSSH'
 cd ~/ipfs-server
 # Use newgrp to get docker group permissions without logout
@@ -193,7 +180,7 @@ if ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no "$SSH_USER@$PUBLIC_IP" \
         CAR_FILE=$(ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no "$SSH_USER@$PUBLIC_IP" \
             "ls -t $REMOTE_DIR/backups/*.car | head -1")
         ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no "$SSH_USER@$PUBLIC_IP" \
-            "cd $REMOTE_DIR && CONTAINER_NAME=ipfs-node-prod ./scripts/restore-from-car.sh $CAR_FILE"
+            "cd $REMOTE_DIR && docker exec ipfs-api python3 -m dr.restore_from_car $CAR_FILE"
         echo -e "${GREEN}✓ Backup restored${NC}"
         echo ""
     fi

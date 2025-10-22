@@ -52,11 +52,11 @@ services:
       - SNAPSHOT_INTERVAL_MINUTES=60
       - AUTO_SNAPSHOT=true
       - SNAPSHOT_TIMEOUT_SECONDS=60
+      - CONTAINER_NAME=ipfs-node-prod  # For DR scripts docker exec
     volumes:
-      - ./scripts:/app/scripts:ro   # Mount scripts for snapshot triggering
       - ./snapshots:/app/snapshots  # Mount snapshots directory
       - ./backups:/app/backups      # Mount backups directory
-      - ./.env:/app/.env:ro         # Mount .env for scripts
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker socket for exec
     depends_on:
       - ipfs
     restart: always

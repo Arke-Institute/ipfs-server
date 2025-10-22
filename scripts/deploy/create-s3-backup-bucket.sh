@@ -75,10 +75,10 @@ cat > /tmp/s3-lifecycle.json << 'EOF'
 {
     "Rules": [
         {
-            "ID": "daily-car-lifecycle",
+            "ID": "instance-backups-lifecycle",
             "Status": "Enabled",
             "Filter": {
-                "Prefix": "daily/"
+                "Prefix": "backups/"
             },
             "Transitions": [
                 {
@@ -124,12 +124,12 @@ echo ""
 echo -e "${GREEN}Bucket Details:${NC}"
 echo -e "  Name: $BUCKET_NAME"
 echo -e "  Region: $REGION"
-echo -e "  URL: s3://$BUCKET_NAME/daily/"
+echo -e "  URL: s3://$BUCKET_NAME/backups/{instance-id}/"
 echo ""
 echo -e "${GREEN}Next Steps:${NC}"
 echo -e "  1. Run: ${YELLOW}./scripts/create-iam-role.sh${NC}"
 echo -e "  2. Attach IAM role to EC2 instance"
-echo -e "  3. Test upload: ${YELLOW}./scripts/upload-to-s3.sh backups/arke-*.car${NC}"
+echo -e "  3. CAR exports auto-upload to instance-specific folders"
 echo ""
 echo -e "${GREEN}Cost Estimate:${NC}"
 echo -e "  ~$2-5/month for typical usage (15MB daily backups)"

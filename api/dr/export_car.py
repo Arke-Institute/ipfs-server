@@ -208,6 +208,92 @@ def get_latest_snapshot() -> Dict[str, Any]:
 
     return json.loads(latest_file.read_text())
 
+def get_instance_id() -> str:
+    """Get EC2 instance ID from metadata service, or 'local' if not on EC2."""
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-m", "2", "http://169.254.169.254/latest/meta-data/instance-id"],
+            capture_output=True,
+            text=True,
+            timeout=3
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except:
+        pass
+    return "local"
+
+def upload_to_s3(car_path: Path, metadata_path: Path, seq: int) -> bool:
+    """Upload CAR file and metadata to S3 with instance-specific folder structure.
+
+    S3 structure: s3://bucket/backups/{instance-id}/arke-{seq}-{timestamp}.car
+    """
+    try:
+        # Get AWS account ID
+        result = subprocess.run(
+            ["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode != 0:
+            warn("Could not get AWS account ID - skipping S3 upload")
+            return False
+
+        account_id = result.stdout.strip()
+        bucket_name = f"arke-ipfs-backups-{account_id}"
+
+        # Get instance ID for folder structure
+        instance_id = get_instance_id()
+        s3_prefix = f"backups/{instance_id}/"
+
+        log(f"Uploading to S3: s3://{bucket_name}/{s3_prefix}")
+        log(f"  Instance ID: {instance_id}")
+
+        # Check if bucket exists
+        check_result = subprocess.run(
+            ["aws", "s3", "ls", f"s3://{bucket_name}", "--region", "us-east-1"],
+            capture_output=True,
+            timeout=10
+        )
+        if check_result.returncode != 0:
+            warn(f"S3 bucket {bucket_name} does not exist - skipping upload")
+            return False
+
+        # Upload CAR file
+        upload_date = datetime.now().strftime("%Y-%m-%d")
+        s3_car_path = f"s3://{bucket_name}/{s3_prefix}{car_path.name}"
+
+        result = subprocess.run([
+            "aws", "s3", "cp", str(car_path), s3_car_path,
+            "--region", "us-east-1",
+            "--storage-class", "STANDARD",
+            "--metadata", f"source=arke-ipfs-ec2,backup-type=automated,upload-date={upload_date},instance-id={instance_id},sequence={seq}"
+        ], capture_output=True, text=True, timeout=300)
+
+        if result.returncode != 0:
+            warn(f"S3 CAR upload failed: {result.stderr}")
+            return False
+
+        success(f"CAR uploaded to {s3_car_path}")
+
+        # Upload metadata JSON
+        if metadata_path.exists():
+            s3_metadata_path = f"s3://{bucket_name}/{s3_prefix}{metadata_path.name}"
+            result = subprocess.run([
+                "aws", "s3", "cp", str(metadata_path), s3_metadata_path,
+                "--region", "us-east-1"
+            ], capture_output=True, text=True, timeout=60)
+
+            if result.returncode == 0:
+                success(f"Metadata uploaded to {s3_metadata_path}")
+
+        return True
+
+    except Exception as e:
+        warn(f"S3 upload failed: {e}")
+        return False
+
 def main():
     log("Starting CAR export...")
 
@@ -257,6 +343,10 @@ def main():
     metadata_path = BACKUPS_DIR / f"{car_filename[:-4]}.json"
     metadata_path.write_text(json.dumps(car_metadata, indent=2))
 
+    # Upload to S3 (if available)
+    print("", file=sys.stderr)
+    s3_uploaded = upload_to_s3(car_path, metadata_path, seq)
+
     # Summary
     print("", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
@@ -268,6 +358,10 @@ def main():
     print(f"Size:       {size_bytes / 1024 / 1024:.2f} MB", file=sys.stderr)
     print(f"CIDs:       {car_metadata['cid_counts']['total']}", file=sys.stderr)
     print(f"Location:   {car_path}", file=sys.stderr)
+    if s3_uploaded:
+        print(f"S3 Backup:  ✓ Uploaded", file=sys.stderr)
+    else:
+        print(f"S3 Backup:  ⚠ Skipped (not on EC2 or bucket unavailable)", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
     print("", file=sys.stderr)
 

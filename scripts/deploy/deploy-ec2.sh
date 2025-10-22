@@ -10,7 +10,7 @@ INSTANCE_TYPE="t3.small"
 VOLUME_SIZE=30
 KEY_NAME="arke-ipfs-key"
 SECURITY_GROUP_NAME="arke-ipfs-sg"
-INSTANCE_NAME="arke-ipfs-server"
+INSTANCE_NAME="${1:-arke-ipfs-server}"  # Allow custom name via argument
 
 # Colors for output
 GREEN='\033[0;32m'
