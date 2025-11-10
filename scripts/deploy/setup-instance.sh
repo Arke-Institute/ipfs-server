@@ -139,8 +139,15 @@ fi
 echo -e "${GREEN}✓ Project files uploaded${NC}"
 echo ""
 
-# Scripts directory is no longer used (DR scripts now in api/dr/ module)
-# Skipping chmod step
+# Upload daily CAR export maintenance script
+echo -e "${BLUE}Step 3b: Uploading maintenance scripts...${NC}"
+ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no "$SSH_USER@$PUBLIC_IP" "mkdir -p $REMOTE_DIR/scripts"
+scp -i "$KEY_FILE" -o StrictHostKeyChecking=no \
+    scripts/daily-car-export.sh "$SSH_USER@$PUBLIC_IP:$REMOTE_DIR/scripts/"
+ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no "$SSH_USER@$PUBLIC_IP" \
+    "chmod +x $REMOTE_DIR/scripts/daily-car-export.sh"
+echo -e "${GREEN}✓ Maintenance scripts uploaded${NC}"
+echo ""
 
 # Start services
 echo -e "${BLUE}Step 4: Starting IPFS services...${NC}"
@@ -221,4 +228,7 @@ echo -e "  2. Set Cloudflare SSL/TLS mode to 'Flexible'"
 echo -e "  3. Test endpoints:"
 echo -e "     ${YELLOW}https://ipfs-api.arke.institute/health${NC}"
 echo -e "     ${YELLOW}https://ipfs-api.arke.institute/events${NC}"
+echo -e "  4. Setup monitoring and automated maintenance:"
+echo -e "     ${YELLOW}./scripts/deploy/setup-monitoring.sh $INSTANCE_ID${NC}"
+echo -e "     (Creates CloudWatch alarms + cron jobs for backups/reboots)"
 echo ""
