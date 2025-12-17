@@ -158,13 +158,23 @@ Always use `parents=true` when creating MFS directories:
 curl -X POST "http://localhost:5001/api/v0/files/mkdir?arg=/arke/index/01/K7&parents=true"
 ```
 
+## Private Network Mode
+
+This node operates as a **private storage backend** with public IPFS network disabled:
+
+- `Routing.Type: none` - No DHT participation
+- `Bootstrap: []` - No public peer discovery
+- Port 4001 bound to `127.0.0.1` - No external swarm connections
+
+This reduces memory from ~1GB to ~50-170MB and eliminates DHT routing overhead. See `CAPACITY.md` for details.
+
 ## Port Configuration
 
-- **4001**: P2P (Swarm) - IPFS network connectivity
-- **5001**: HTTP RPC API - API Service communication (localhost-only in production)
-- **8080**: HTTP Gateway - Content browsing (localhost-only in production)
+- **4001**: P2P (Swarm) - Localhost only (private mode)
+- **5001**: HTTP RPC API - Localhost only
+- **8080**: HTTP Gateway - Not exposed (accessed via nginx)
 
-In production (`docker-compose.prod.yml`), ports 5001 and 8080 are bound to `127.0.0.1` for security.
+In production, all ports are bound to `127.0.0.1`. External access goes through nginx reverse proxy.
 
 ## Resource Limits
 
@@ -205,8 +215,10 @@ See `DR_TEST.md` for complete nuclear test procedure (verified working as of 202
 - `API_WALKTHROUGH.md` - Complete guide to implementing Arke API endpoints using Kubo RPC
 - `DISASTER_RECOVERY.md` - Full DR strategy and procedures
 - `DR_TEST.md` - Step-by-step nuclear DR test
+- `CAPACITY.md` - Private network config and capacity limits
+- `MONITORING.md` - Automated maintenance and alerting
 - `docker-compose.yml` - Local development configuration
-- `docker-compose.prod.yml` - Production configuration with security hardening
+- `docker-compose.nginx.yml` - Production configuration with nginx reverse proxy
 
 ## Common Pitfalls
 
