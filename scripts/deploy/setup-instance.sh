@@ -109,6 +109,11 @@ echo -e "  Uploading API service..."
 scp -i "$KEY_FILE" -o StrictHostKeyChecking=no -r \
     api/ "$SSH_USER@$PUBLIC_IP:$REMOTE_DIR/"
 
+# Upload IPFS init scripts (for private mode configuration)
+echo -e "  Uploading IPFS init scripts..."
+scp -i "$KEY_FILE" -o StrictHostKeyChecking=no -r \
+    ipfs-init.d/ "$SSH_USER@$PUBLIC_IP:$REMOTE_DIR/"
+
 # Upload main files
 for file in "${FILES_TO_UPLOAD[@]}"; do
     if [ -f "$file" ]; then

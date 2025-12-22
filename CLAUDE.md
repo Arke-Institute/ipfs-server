@@ -160,11 +160,13 @@ curl -X POST "http://localhost:5001/api/v0/files/mkdir?arg=/arke/index/01/K7&par
 
 ## Private Network Mode
 
-This node operates as a **private storage backend** with public IPFS network disabled:
+This node operates as a **private storage backend** with public IPFS network disabled. Configuration is automated via `ipfs-init.d/001-private-mode.sh` which runs on every container startup.
 
+Key settings applied:
 - `Routing.Type: none` - No DHT participation
 - `Bootstrap: []` - No public peer discovery
 - Port 4001 bound to `127.0.0.1` - No external swarm connections
+- All relay/NAT services disabled
 
 This reduces memory from ~1GB to ~50-170MB and eliminates DHT routing overhead. See `CAPACITY.md` for details.
 
@@ -219,6 +221,7 @@ See `DR_TEST.md` for complete nuclear test procedure (verified working as of 202
 - `MONITORING.md` - Automated maintenance and alerting
 - `docker-compose.yml` - Local development configuration
 - `docker-compose.nginx.yml` - Production configuration with nginx reverse proxy
+- `ipfs-init.d/001-private-mode.sh` - Configures IPFS for offline/private mode on startup
 
 ## Common Pitfalls
 

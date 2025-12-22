@@ -4,15 +4,23 @@
 
 This IPFS node operates as a **private storage backend** with public network participation disabled. This dramatically reduces resource consumption.
 
-### Configuration Applied (December 2024)
+### Configuration (Automated via Init Script)
+
+The private mode configuration is automatically applied on every container startup via `ipfs-init.d/001-private-mode.sh`. This ensures settings persist across container restarts and volume recreations.
 
 | Setting | Value | Purpose |
 |---------|-------|---------|
 | `Routing.Type` | `none` | Disables DHT participation |
 | `Bootstrap` | `[]` (empty) | No public peer discovery |
 | `Addresses.Announce` | `[]` | No address announcements |
-| `Swarm.ConnMgr.LowWater` | `20` | Min peer connections |
-| `Swarm.ConnMgr.HighWater` | `50` | Max peer connections |
+| `Addresses.NoAnnounce` | `[all]` | Block all address announcements |
+| `Swarm.ConnMgr.LowWater` | `0` | Zero minimum connections |
+| `Swarm.ConnMgr.HighWater` | `10` | Very low max connections |
+| `Swarm.RelayClient.Enabled` | `false` | No relay client |
+| `Swarm.RelayService.Enabled` | `false` | No relay service |
+| `Swarm.EnableHolePunching` | `false` | No hole punching |
+| `AutoNAT.ServiceMode` | `disabled` | No NAT detection |
+| `Swarm.ResourceMgr.Enabled` | `false` | Disabled resource manager |
 | Port 4001 | `127.0.0.1:4001` | Swarm bound to localhost only |
 
 ### Impact
@@ -132,33 +140,42 @@ docker logs ipfs-nginx --since 1h 2>&1 | grep -c "POST /api/v0"
 
 ## Troubleshooting High Resource Usage
 
+> **Note**: With the automated init script (`ipfs-init.d/001-private-mode.sh`), private mode is configured on every startup. These steps should rarely be needed.
+
 If CPU/memory spikes unexpectedly:
 
-1. **Check peer count** - Should be near 0
+1. **Check peer count** - Should be 0
    ```bash
    curl -s -X POST http://localhost:5001/api/v0/swarm/peers | jq '.Peers | length'
    ```
 
-2. **If peers > 50**, public network may have been re-enabled:
+2. **If any peers connected**, check if init script ran:
    ```bash
+   # Check container logs for init script output
+   docker logs ipfs-node-prod 2>&1 | grep "Private mode"
+
    # Verify routing is disabled
    curl -s -X POST http://localhost:5001/api/v0/config/show | jq '.Routing.Type'
    # Should return "none"
    ```
 
-3. **Re-apply private mode** if needed:
+3. **If init script didn't run**, verify mount:
    ```bash
-   docker exec ipfs-node-prod ipfs config Routing.Type none
-   docker exec ipfs-node-prod ipfs bootstrap rm --all
-   docker restart ipfs-node-prod
+   docker exec ipfs-node-prod ls -la /container-init.d/
+   # Should show 001-private-mode.sh
    ```
 
-4. **Disconnect stray peers**:
+4. **Disconnect stray peers** (if any):
    ```bash
    peers=$(curl -s -X POST http://localhost:5001/api/v0/swarm/peers | jq -r '.Peers[].Peer')
    for p in $peers; do
      curl -s -X POST "http://localhost:5001/api/v0/swarm/disconnect?arg=/p2p/$p" > /dev/null
    done
+   ```
+
+5. **Force restart** to re-run init script:
+   ```bash
+   docker compose -f docker-compose.nginx.yml restart ipfs
    ```
 
 ---

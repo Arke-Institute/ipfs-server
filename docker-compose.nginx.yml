@@ -10,12 +10,13 @@ services:
       - IPFS_PROFILE=server
       - IPFS_FD_MAX=4096
     ports:
-      - "4001:4001"              # P2P (Swarm) - public
+      - "127.0.0.1:4001:4001"    # P2P (Swarm) - localhost only (private mode)
       - "127.0.0.1:5001:5001"    # API - localhost only (for backup scripts)
       # Gateway NOT exposed directly - only via nginx
     volumes:
       - ipfs_data:/data/ipfs
       - ipfs_staging:/export
+      - ./ipfs-init.d:/container-init.d:ro  # Private mode init script
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "ipfs id || exit 1"]
