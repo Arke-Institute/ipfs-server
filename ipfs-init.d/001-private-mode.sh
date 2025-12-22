@@ -32,9 +32,17 @@ ipfs config --json Swarm.EnableHolePunching false
 # Disable AutoNAT (we don't need NAT traversal detection)
 ipfs config --json AutoNAT.ServiceMode '"disabled"'
 
-# Disable resource manager announce (reduces overhead)
+# Disable resource manager (reduces overhead for private node)
 ipfs config --json Swarm.ResourceMgr.Enabled false
+
+# Block ALL connections via swarm filters (prevents reconnection to cached peers)
+# This is the nuclear option - no peer connections allowed at all
+ipfs config --json Swarm.AddrFilters '[
+  "/ip4/0.0.0.0/ipcidr/0",
+  "/ip6/::/ipcidr/0"
+]'
 
 echo "=== Private mode configuration complete ==="
 echo "Routing.Type: $(ipfs config Routing.Type)"
 echo "Bootstrap nodes: $(ipfs bootstrap list | wc -l)"
+echo "Swarm filters: $(ipfs config Swarm.AddrFilters | wc -l) rules (blocking all)"
