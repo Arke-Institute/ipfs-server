@@ -4,15 +4,22 @@ from config import settings
 from models import IndexPointer
 import json
 
+# Explicit timeout configuration to prevent hanging on dead connections
+_default_timeout = httpx.Timeout(
+    connect=5.0,    # Connection establishment
+    read=10.0,      # Reading response
+    write=10.0,     # Writing request
+    pool=5.0        # Waiting for connection from pool
+)
+
 async def get_index_pointer() -> IndexPointer:
     """Read index pointer from MFS."""
     try:
         # Try to read from MFS
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=_default_timeout) as client:
             response = await client.post(
                 f"{settings.IPFS_API_URL}/files/read",
                 params={"arg": settings.INDEX_POINTER_PATH},
-                timeout=5.0
             )
             response.raise_for_status()
             data = response.json()
@@ -34,19 +41,27 @@ async def get_index_pointer() -> IndexPointer:
             )
         raise
 
-async def update_index_pointer(pointer: IndexPointer, timeout: float = 60.0):
+async def update_index_pointer(pointer: IndexPointer, timeout: float = 30.0):
     """Write index pointer to MFS.
 
     Args:
         pointer: IndexPointer to write
-        timeout: HTTP timeout in seconds (default 60s, increase for large operations)
+        timeout: HTTP read timeout in seconds (default 30s, increase for large operations)
     """
     pointer.last_updated = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
     # Convert to JSON
     data = pointer.model_dump_json()
 
-    async with httpx.AsyncClient() as client:
+    # Use explicit timeout with connection limits
+    write_timeout = httpx.Timeout(
+        connect=5.0,
+        read=timeout,
+        write=timeout,
+        pool=5.0
+    )
+
+    async with httpx.AsyncClient(timeout=write_timeout) as client:
         # Write to MFS
         response = await client.post(
             f"{settings.IPFS_API_URL}/files/write",
@@ -57,6 +72,5 @@ async def update_index_pointer(pointer: IndexPointer, timeout: float = 60.0):
                 "parents": "true"
             },
             files={"file": ("pointer.json", data.encode(), "application/json")},
-            timeout=timeout
         )
         response.raise_for_status()
