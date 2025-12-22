@@ -129,6 +129,16 @@ Located in `scripts/`:
 
 ## Key Implementation Details
 
+### Event Queue System
+
+Events from `POST /events/append` are processed through an in-memory queue with batch processing:
+- Events return immediately with `{"queued": true, "success": true}`
+- Background worker batches up to 50 events or waits 500ms
+- Reduces per-event overhead and prevents Cloudflare timeouts
+- Monitor via `GET /events/queue-stats`
+
+See `api/event_queue.py` for implementation.
+
 ### CAS (Compare-And-Swap) for Updates
 
 When adding versions, always implement CAS to prevent conflicts:
@@ -222,6 +232,7 @@ See `DR_TEST.md` for complete nuclear test procedure (verified working as of 202
 - `docker-compose.yml` - Local development configuration
 - `docker-compose.nginx.yml` - Production configuration with nginx reverse proxy
 - `ipfs-init.d/001-private-mode.sh` - Configures IPFS for offline/private mode on startup
+- `api/event_queue.py` - In-memory event queue with batch processing
 
 ## Common Pitfalls
 

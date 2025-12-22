@@ -299,6 +299,63 @@ async def query_chain(limit: int = 10, cursor: str = None):
     return items, current_cid  # next_cursor
 ```
 
+### Event Queue System
+
+Events are processed through an **in-memory queue with batch processing** to handle high concurrency without blocking API responses.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    EVENT QUEUE FLOW                          │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│   POST /events/append                                        │
+│         │                                                    │
+│         ▼                                                    │
+│   ┌───────────┐                                              │
+│   │   Queue   │  ← Immediate return: {"queued": true}        │
+│   └─────┬─────┘                                              │
+│         │                                                    │
+│         ▼                                                    │
+│   ┌───────────────────────────┐                              │
+│   │   Background Worker       │                              │
+│   │   - Collects up to 50     │                              │
+│   │   - Or waits 500ms        │                              │
+│   │   - Processes batch       │                              │
+│   └─────┬─────────────────────┘                              │
+│         │                                                    │
+│         ▼                                                    │
+│   IPFS dag/put (batch of events)                             │
+│         │                                                    │
+│         ▼                                                    │
+│   Update index pointer (once per batch)                      │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Configuration** (in `api/event_queue.py`):
+- `BATCH_SIZE = 50` - Maximum events per batch
+- `BATCH_TIMEOUT_MS = 500` - Maximum wait before processing partial batch
+
+**Benefits**:
+- API responds immediately (no Cloudflare timeouts)
+- Batched IPFS writes reduce per-event overhead
+- Single index pointer update per batch (not per event)
+- Graceful shutdown flushes remaining events
+
+**Monitoring**:
+```bash
+# Check queue status
+curl http://ipfs-api.arke.institute/events/queue-stats
+# → {"queue_size": 0, "batch_size": 50, "batch_timeout_ms": 500}
+```
+
+**Observed Performance** (scale test 2025-12-22):
+- Peak queue: ~1,600 events
+- Drain rate: ~24 events/second sustained
+- Batch processing: 50-100 events every 3-4 seconds
+
+---
+
 ### Chain Continuity
 
 **Critical**: The chain is NEVER broken. Even after snapshot builds:
@@ -645,23 +702,38 @@ List entities with cursor pagination
 }
 ```
 
-#### POST /chain/append
-Append new entity to recent chain
+#### POST /events/append
+Queue an event for appending to the chain (async processing)
 
 **Request Body:**
 ```json
 {
+  "type": "create",
   "pi": "01K75ZZZ...",
   "tip_cid": "baguqee...",
   "ver": 1
 }
 ```
 
+**Response** (immediate):
+```json
+{
+  "queued": true,
+  "success": true
+}
+```
+
+Events are processed asynchronously by a background worker in batches of up to 50.
+
+#### GET /events/queue-stats
+Get current event queue statistics
+
 **Response:**
 ```json
 {
-  "cid": "baguqeerayq...",
-  "success": true
+  "queue_size": 0,
+  "batch_size": 50,
+  "batch_timeout_ms": 500
 }
 ```
 
