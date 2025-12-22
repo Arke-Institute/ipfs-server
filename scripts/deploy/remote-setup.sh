@@ -66,6 +66,23 @@ sudo systemctl start docker
 echo -e "${GREEN}✓ Docker service started${NC}"
 echo ""
 
+# Increase file descriptor limits for high concurrency
+echo -e "${BLUE}Step 3.5: Increasing file descriptor limits...${NC}"
+# Add to limits.conf if not already present
+if ! grep -q "nofile 65536" /etc/security/limits.conf 2>/dev/null; then
+    echo "* soft nofile 65536" | sudo tee -a /etc/security/limits.conf
+    echo "* hard nofile 65536" | sudo tee -a /etc/security/limits.conf
+    echo "root soft nofile 65536" | sudo tee -a /etc/security/limits.conf
+    echo "root hard nofile 65536" | sudo tee -a /etc/security/limits.conf
+fi
+# Add to sysctl if not already present
+if ! grep -q "fs.file-max" /etc/sysctl.conf 2>/dev/null; then
+    echo "fs.file-max = 65536" | sudo tee -a /etc/sysctl.conf
+    sudo sysctl -p
+fi
+echo -e "${GREEN}✓ File descriptor limits increased to 65536${NC}"
+echo ""
+
 # Create working directory
 echo -e "${BLUE}Step 4: Setting up working directory...${NC}"
 mkdir -p ~/ipfs-server

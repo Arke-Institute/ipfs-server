@@ -1,43 +1,25 @@
+"""
+Event management for the Arke event chain.
+
+Events are appended via an in-memory queue for immediate response,
+then batch-processed by a background worker.
+"""
+
 import httpx
 from datetime import datetime, timezone
 from config import settings
-from models import Event, IndexPointer
 import index_pointer
-import json
 import asyncio
 import subprocess
-import os
 from pathlib import Path
 
-# Global lock to prevent race conditions during event append operations
-_event_append_lock = asyncio.Lock()
+# Import queue functions
+import event_queue
 
-# Shared HTTP client for connection pooling and proper cleanup
-_http_client: httpx.AsyncClient | None = None
 
-async def get_http_client() -> httpx.AsyncClient:
-    """Get or create shared HTTP client with proper timeouts."""
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=5.0,    # Connection timeout
-                read=10.0,      # Read timeout
-                write=10.0,     # Write timeout
-                pool=5.0        # Pool timeout
-            )
-        )
-    return _http_client
-
-# Maximum time to wait for lock acquisition (prevents infinite queue)
-LOCK_TIMEOUT = 30.0
-
-# Maximum time for entire append operation
-OPERATION_TIMEOUT = 45.0
-
-async def append_event(event_type: str, pi: str, ver: int, tip_cid: str) -> str:
+async def append_event(event_type: str, pi: str, ver: int, tip_cid: str) -> dict:
     """
-    Append new event to the event chain.
+    Queue an event for appending to the event chain.
 
     Args:
         event_type: "create" or "update"
@@ -46,81 +28,13 @@ async def append_event(event_type: str, pi: str, ver: int, tip_cid: str) -> str:
         tip_cid: Manifest CID
 
     Returns:
-        Event CID
+        {"queued": True, "success": True}
 
-    Uses a lock to prevent race conditions when multiple concurrent requests
-    try to append to the event chain simultaneously. Includes timeouts to
-    prevent deadlocks if IPFS becomes unresponsive.
+    Events are queued immediately and processed in batches by a background
+    worker. This prevents Cloudflare timeouts under high load.
     """
-    try:
-        # Wrap entire operation in a timeout to prevent infinite hangs
-        return await asyncio.wait_for(
-            _append_event_impl(event_type, pi, ver, tip_cid),
-            timeout=OPERATION_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        print(f"⚠️ Event append timed out after {OPERATION_TIMEOUT}s (type={event_type}, pi={pi})")
-        raise Exception(f"Event append timed out after {OPERATION_TIMEOUT}s")
+    return await event_queue.enqueue_event(event_type, pi, ver, tip_cid)
 
-async def _append_event_impl(event_type: str, pi: str, ver: int, tip_cid: str) -> str:
-    """Internal implementation with timeout-protected lock acquisition."""
-
-    # Try to acquire lock with timeout (prevents infinite queue buildup)
-    try:
-        await asyncio.wait_for(
-            _event_append_lock.acquire(),
-            timeout=LOCK_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        print(f"⚠️ Failed to acquire event lock after {LOCK_TIMEOUT}s (type={event_type}, pi={pi})")
-        raise Exception(f"Event append lock timeout - server busy")
-
-    try:
-        # 1. Get current index pointer
-        pointer = await index_pointer.get_index_pointer()
-
-        # 2. Create new event
-        event = Event(
-            type=event_type,
-            pi=pi,
-            ver=ver,
-            tip_cid={"/": tip_cid},
-            ts=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-            prev={"/": pointer.event_head} if pointer.event_head else None
-        )
-
-        # 3. Store as DAG-CBOR (more efficient and works with HTTP API dag/get)
-        client = await get_http_client()
-        response = await client.post(
-            f"{settings.IPFS_API_URL}/dag/put",
-            params={
-                "store-codec": "dag-cbor",
-                "input-codec": "json",
-                "pin": "true"
-            },
-            files={"file": ("event.json", event.model_dump_json().encode(), "application/json")},
-        )
-        response.raise_for_status()
-
-        # Parse the response to get the CID
-        result_text = response.text.strip()
-        result = json.loads(result_text)
-        new_cid = result["Cid"]["/"]
-
-        # 4. Update index pointer
-        pointer.event_head = new_cid
-        pointer.event_count += 1
-
-        # Update total_count only for create events
-        if event_type == "create":
-            pointer.total_count += 1
-
-        await index_pointer.update_index_pointer(pointer)
-
-        return new_cid
-    finally:
-        # ALWAYS release the lock, even if an exception occurred
-        _event_append_lock.release()
 
 async def query_events(limit: int = 50, cursor: str | None = None) -> tuple[list[dict], str | None]:
     """
@@ -177,6 +91,16 @@ async def query_events(limit: int = 50, cursor: str | None = None) -> tuple[list
         # More events available
         return events, current_cid
 
+
+def get_queue_stats() -> dict:
+    """Get current queue statistics for monitoring."""
+    return {
+        "queue_size": event_queue.get_queue_size(),
+        "batch_size": event_queue.BATCH_SIZE,
+        "batch_timeout_ms": event_queue.BATCH_TIMEOUT_MS
+    }
+
+
 async def trigger_scheduled_snapshot():
     """
     Triggered by scheduler every N minutes.
@@ -208,6 +132,7 @@ async def trigger_scheduled_snapshot():
     # Run in thread pool to avoid blocking async event loop
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, _run_snapshot_build, trigger_time, pointer.total_count, pointer.event_count)
+
 
 def _run_snapshot_build(trigger_time: str, total_pis: int, total_events: int):
     """

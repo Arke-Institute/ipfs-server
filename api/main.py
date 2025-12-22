@@ -5,6 +5,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from config import settings
 import index_pointer
 import events
+import event_queue
 from models import AppendEventRequest
 import httpx
 
@@ -128,7 +129,7 @@ async def get_latest_snapshot():
 @app.post("/events/append")
 async def append_event(request: AppendEventRequest):
     """
-    Append event to chain.
+    Queue an event for appending to the chain.
     Called by API wrapper after entity creation/update.
 
     Request body:
@@ -136,17 +137,26 @@ async def append_event(request: AppendEventRequest):
     - pi: Persistent identifier
     - ver: Version number
     - tip_cid: Manifest CID
+
+    Returns immediately with {"queued": true, "success": true}.
+    Events are processed in batches by a background worker.
     """
     try:
-        event_cid = await events.append_event(
+        result = await events.append_event(
             event_type=request.type,
             pi=request.pi,
             ver=request.ver,
             tip_cid=request.tip_cid
         )
-        return {"event_cid": event_cid, "success": True}
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/events/queue-stats")
+async def get_queue_stats():
+    """Get current event queue statistics for monitoring."""
+    return events.get_queue_stats()
 
 @app.post("/snapshot/rebuild")
 async def rebuild_snapshot():
@@ -160,7 +170,11 @@ async def rebuild_snapshot():
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize scheduler on startup."""
+    """Initialize event queue worker and scheduler on startup."""
+    # Start event queue worker
+    await event_queue.start_worker()
+
+    # Start snapshot scheduler
     if settings.AUTO_SNAPSHOT:
         interval = settings.SNAPSHOT_INTERVAL_MINUTES
         print(f"🕐 Starting snapshot scheduler (every {interval} minutes)")
@@ -177,9 +191,14 @@ async def startup_event():
     else:
         print("ℹ️  Auto-snapshot disabled (AUTO_SNAPSHOT=false)")
 
+
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Shutdown scheduler on app shutdown."""
+    """Shutdown event queue worker and scheduler."""
+    # Stop event queue worker (flushes remaining events)
+    await event_queue.stop_worker()
+
+    # Stop scheduler
     if scheduler.running:
         scheduler.shutdown()
         print("🛑 Snapshot scheduler stopped")
