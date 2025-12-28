@@ -127,6 +127,30 @@ Located in `scripts/`:
 - `snapshots/latest.json` - Symlink to most recent snapshot
 - `backups/` - CAR files named `arke-{seq}-{timestamp}.car`
 
+### Append-Only Proofs (v2 Snapshots)
+
+Starting with snapshot schema v2, snapshots include cryptographic proof that no historical data has been deleted:
+
+```json
+{
+  "schema": "arke/snapshot@v2",
+  "merkle_root": "18b584f72e70e...",
+  "cid_count": 28997,
+  "all_cids": ["bafkrei...", ...],
+  "consistency": {
+    "added_count": 7,
+    "deleted_count": 0,
+    "is_append_only": true
+  }
+}
+```
+
+- `all_cids` contains EVERY CID in the archive (all manifest versions + components)
+- `merkle_root` is a SHA256 Merkle tree root over sorted CIDs
+- `consistency` proves no CIDs were deleted since the previous snapshot
+
+See `APPEND_ONLY_PROOFS.md` for full documentation.
+
 ## Key Implementation Details
 
 ### Event Queue System
@@ -227,12 +251,14 @@ See `DR_TEST.md` for complete nuclear test procedure (verified working as of 202
 - `API_WALKTHROUGH.md` - Complete guide to implementing Arke API endpoints using Kubo RPC
 - `DISASTER_RECOVERY.md` - Full DR strategy and procedures
 - `DR_TEST.md` - Step-by-step nuclear DR test
+- `APPEND_ONLY_PROOFS.md` - Cryptographic append-only verification system
 - `CAPACITY.md` - Private network config and capacity limits
 - `MONITORING.md` - Automated maintenance and alerting
 - `docker-compose.yml` - Local development configuration
 - `docker-compose.nginx.yml` - Production configuration with nginx reverse proxy
 - `ipfs-init.d/001-private-mode.sh` - Configures IPFS for offline/private mode on startup
 - `api/event_queue.py` - In-memory event queue with batch processing
+- `api/dr/build_snapshot.py` - Snapshot building with append-only proofs
 
 ## Common Pitfalls
 
