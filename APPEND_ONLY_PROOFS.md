@@ -56,6 +56,22 @@ For each entity, we collect:
 
 This means deleting ANY historical version changes the Merkle root.
 
+### What's NOT Included
+
+**Test network entities are excluded from proofs.** The Arke system maintains separate storage for test and production data:
+
+| Network | MFS Path | Included in Proofs |
+|---------|----------|-------------------|
+| Main | `/arke/index/{shard}/{pi}.tip` | ✅ Yes |
+| Test | `/arke/test/index/{shard}/{pi}.tip` | ❌ No |
+
+Test entities are identified by their `II` prefix (e.g., `IIAK75HQQXNTDG7BBP7PS9AWY`). They:
+- Use a separate MFS directory (`/arke/test/`)
+- Have their own event chain (or none)
+- Are designed for integration testing, not permanent archival
+
+This is intentional - test data is ephemeral and shouldn't be mixed with production proofs. If test network proofs were ever needed, a separate snapshot system would be required.
+
 ---
 
 ## Verification
